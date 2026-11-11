@@ -1,0 +1,18 @@
+# C++
+engine/build/
+
+# Python
+backend/.venv/
+backend/data/
+__pycache__/
+.pytest_cache/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/

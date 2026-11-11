@@ -1,0 +1,9 @@
+[project]
+name = "aeroflow-backend"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient`:DeprecationWarning"]
