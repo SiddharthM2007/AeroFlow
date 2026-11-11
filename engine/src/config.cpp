@@ -95,11 +95,29 @@ Aabb parse_test_box(const json& obj, const GridConfig& config) {
   return box;
 }
 
+MeshSource parse_mesh(const json& obj) {
+  const std::string path = "mesh";
+  if (!obj.is_object()) fail(path, "must be an object or null");
+  reject_unknown_keys(obj, {"triangles_file", "bvh_leaf_size"}, path);
+  MeshSource mesh;
+  const auto file = obj.find("triangles_file");
+  if (file == obj.end()) fail(path + ".triangles_file", "is required");
+  if (!file->is_string() || file->get<std::string>().empty()) {
+    fail(path + ".triangles_file", "must be a non-empty string");
+  }
+  mesh.triangles_file = file->get<std::string>();
+  if (obj.contains("bvh_leaf_size")) {
+    mesh.bvh_leaf_size = require_count(obj, "bvh_leaf_size", path);
+    if (mesh.bvh_leaf_size > 64) fail(path + ".bvh_leaf_size", "must be <= 64");
+  }
+  return mesh;
+}
+
 }  // namespace
 
 GridConfig parse_config(const json& root) {
   if (!root.is_object()) throw ConfigError("config: top-level value must be a JSON object");
-  reject_unknown_keys(root, {"domain", "resolution", "test_box"}, "");
+  reject_unknown_keys(root, {"domain", "resolution", "test_box", "mesh"}, "");
 
   GridConfig config;
 
@@ -124,6 +142,12 @@ GridConfig parse_config(const json& root) {
 
   if (const auto it = root.find("test_box"); it != root.end() && !it->is_null()) {
     config.test_box = parse_test_box(*it, config);
+  }
+  if (const auto it = root.find("mesh"); it != root.end() && !it->is_null()) {
+    if (config.test_box) {
+      fail("mesh", "test_box and mesh are mutually exclusive; choose one geometry source");
+    }
+    config.mesh = parse_mesh(*it);
   }
   return config;
 }

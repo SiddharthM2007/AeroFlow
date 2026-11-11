@@ -1,35 +1,36 @@
 import { OrbitControls, TransformControls } from "@react-three/drei";
-import { Canvas } from "@react-three/fiber";
-import { useMemo, useState } from "react";
-import { ArrowHelper, BoxGeometry, BufferGeometry, EdgesGeometry, MathUtils, Mesh, Vector3 } from "three";
+import { Canvas, useThree } from "@react-three/fiber";
+import { useEffect, useMemo, useState } from "react";
+import { ArrowHelper, BoxGeometry, EdgesGeometry, Group, MathUtils, PerspectiveCamera, Vector3 } from "three";
+import { frameBounds } from "../lib/camera";
 import type { LoadedModel } from "../lib/loaders";
+import { UNIT_TO_METERS, type Bounds, type LengthUnit } from "../lib/transform";
 import type { Domain, GizmoMode, ModelTransform, TestBox } from "../lib/types";
 import { GridOverlay, type GridOverlayProps } from "./GridOverlay";
 
 interface ViewerProps {
   domain: Domain;
   model: LoadedModel | null;
+  units: LengthUnit;
   transform: ModelTransform;
   onTransformChange: (t: ModelTransform) => void;
   gizmoMode: GizmoMode;
   modelOpacity: number;
   testBox: TestBox | null;
   grid: GridOverlayProps;
+  /** Camera framing request; a new `id` re-frames the camera onto `bounds`. */
+  frame: { id: number; bounds: Bounds };
 }
+
+const FOV = 45;
 
 export function Viewer(props: ViewerProps) {
   const { domain } = props;
-  const center = useMemo(
-    () => [domain.lx / 2, domain.ly / 2, domain.lz / 2] as [number, number, number],
-    [domain],
-  );
   const span = Math.max(domain.lx, domain.ly, domain.lz);
 
   return (
-    <Canvas
-      camera={{ position: [center[0] - span * 0.6, center[1] + span * 0.7, center[2] + span * 1.3], fov: 45, near: 0.001, far: span * 100 }}
-      gl={{ antialias: true }}
-    >
+    <Canvas camera={{ fov: FOV }} gl={{ antialias: true }}>
+      <CameraRig frame={props.frame} />
       <color attach="background" args={["#11151c"]} />
       <ambientLight intensity={0.5} />
       <directionalLight position={[5, 10, 7]} intensity={1.1} />
@@ -40,6 +41,7 @@ export function Viewer(props: ViewerProps) {
       {props.model && (
         <ModelObject
           model={props.model}
+          units={props.units}
           transform={props.transform}
           onChange={props.onTransformChange}
           mode={props.gizmoMode}
@@ -49,9 +51,33 @@ export function Viewer(props: ViewerProps) {
       <GridOverlay {...props.grid} />
 
       <axesHelper args={[span * 0.15]} />
-      <OrbitControls makeDefault target={center} />
+      <OrbitControls makeDefault />
     </Canvas>
   );
+}
+
+/** Applies framing requests to the camera and orbit controls. */
+function CameraRig({ frame }: { frame: { id: number; bounds: Bounds } }) {
+  const camera = useThree((s) => s.camera) as PerspectiveCamera;
+  const controls = useThree((s) => s.controls) as unknown as { target: Vector3; update: () => void } | null;
+  const size = useThree((s) => s.size);
+
+  useEffect(() => {
+    const f = frameBounds(frame.bounds, FOV, size.width / Math.max(size.height, 1));
+    camera.position.set(...f.position);
+    camera.near = f.near;
+    camera.far = f.far;
+    camera.updateProjectionMatrix();
+    if (controls) {
+      controls.target.set(...f.target);
+      controls.update();
+    } else {
+      camera.lookAt(...f.target);
+    }
+    // Re-frame only on explicit requests (and once controls exist), not on every resize.
+  }, [frame.id, controls]);
+
+  return null;
 }
 
 function TunnelBox({ domain }: { domain: Domain }) {
@@ -95,38 +121,48 @@ function TestBoxMesh({ box }: { box: TestBox }) {
 
 interface ModelObjectProps {
   model: LoadedModel;
+  units: LengthUnit;
   transform: ModelTransform;
   onChange: (t: ModelTransform) => void;
   mode: GizmoMode;
   opacity: number;
 }
 
-function ModelObject({ model, transform, onChange, mode, opacity }: ModelObjectProps) {
-  const [mesh, setMesh] = useState<Mesh<BufferGeometry> | null>(null);
+/**
+ * Outer group = user transform (T·R·S, driven by the gizmo); inner mesh = unit conversion and
+ * pivot offset (U·(p − pivot)). Together: p_world = T·R·S·U·(p_raw − pivot), matching
+ * lib/transform.ts modelMatrix(). The imported geometry itself is never modified.
+ */
+function ModelObject({ model, units, transform, onChange, mode, opacity }: ModelObjectProps) {
+  const [group, setGroup] = useState<Group | null>(null);
   const rotation = transform.rotation.map((d) => MathUtils.degToRad(d)) as [number, number, number];
+  const u = UNIT_TO_METERS[units];
+  const pivotOffset = model.pivot.map((c) => -c * u) as [number, number, number];
 
   return (
     <>
-      <mesh ref={setMesh} geometry={model.geometry} position={transform.position} rotation={rotation} scale={transform.scale}>
-        <meshStandardMaterial
-          color="#cfd8dc"
-          metalness={0.1}
-          roughness={0.6}
-          transparent={opacity < 1}
-          opacity={opacity}
-          depthWrite={opacity >= 1}
-        />
-      </mesh>
-      {mesh && mode !== "none" && (
+      <group ref={setGroup} position={transform.position} rotation={rotation} scale={transform.scale}>
+        <mesh geometry={model.geometry} position={pivotOffset} scale={[u, u, u]}>
+          <meshStandardMaterial
+            color="#cfd8dc"
+            metalness={0.1}
+            roughness={0.6}
+            transparent={opacity < 1}
+            opacity={opacity}
+            depthWrite={opacity >= 1}
+          />
+        </mesh>
+      </group>
+      {group && mode !== "none" && (
         <TransformControls
-          object={mesh}
+          object={group}
           mode={mode}
           size={0.8}
           onObjectChange={() =>
             onChange({
-              position: mesh.position.toArray() as [number, number, number],
-              rotation: [mesh.rotation.x, mesh.rotation.y, mesh.rotation.z].map((r) => MathUtils.radToDeg(r)) as [number, number, number],
-              scale: mesh.scale.toArray() as [number, number, number],
+              position: group.position.toArray() as [number, number, number],
+              rotation: [group.rotation.x, group.rotation.y, group.rotation.z].map((r) => MathUtils.radToDeg(r)) as [number, number, number],
+              scale: group.scale.toArray() as [number, number, number],
             })
           }
         />

@@ -238,3 +238,32 @@ button.primary {
 input[type="range"] {
   flex: 1;
 }
+
+.proposal {
+  margin-top: 10px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  line-height: 1.6;
+}
+
+.proposal-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.proposal .primary {
+  width: auto;
+  padding: 5px 10px;
+}
+
+.row.wrap {
+  flex-wrap: wrap;
+}
+
+.field.units {
+  margin: 8px 0 4px;
+}

@@ -1,0 +1,21 @@
+# 40 x 20 x 10 box (file units), outward winding.
+# Shared by frontend/src/lib/consistency.test.ts and backend/tests/test_mesh.py to check that
+# the viewer and the engine see identical world-space geometry.
+# Exercises quad faces (fan triangulation), v/vt/vn tokens and negative (relative) indices.
+o box
+v 0 0 0
+v 40 0 0
+v 40 20 0
+v 0 20 0
+v 0 0 10
+v 40 0 10
+v 40 20 10
+v 0 20 10
+vt 0 0
+vn 1 0 0
+f 1 4 3 2
+f 5 6 7 8
+f 1 2 6 5
+f 4 8 7 3
+f -8 -4 -1 -5
+f 2/1/1 3/1/1 7/1/1 6/1/1

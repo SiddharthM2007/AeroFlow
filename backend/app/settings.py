@@ -17,12 +17,18 @@ class Settings:
     max_upload_bytes: int
     max_cells: int
     max_cells_per_axis: int
+    max_triangles: int
     max_jobs_retained: int
     cors_origins: tuple[str, ...]
 
     @property
     def models_dir(self) -> Path:
         return self.data_dir / "models"
+
+    @property
+    def work_dir(self) -> Path:
+        """Scratch space for engine input files (world-space triangle files)."""
+        return self.data_dir / "work"
 
 
 def load_settings() -> Settings:
@@ -37,6 +43,7 @@ def load_settings() -> Settings:
         # 128^3 keeps the base64 classification payload around 2.8 MB.
         max_cells=int(env.get("AEROFLOW_MAX_CELLS", str(128**3))),
         max_cells_per_axis=int(env.get("AEROFLOW_MAX_CELLS_PER_AXIS", "512")),
+        max_triangles=int(env.get("AEROFLOW_MAX_TRIANGLES", "1000000")),
         max_jobs_retained=int(env.get("AEROFLOW_MAX_JOBS", "50")),
         cors_origins=tuple(
             o.strip()

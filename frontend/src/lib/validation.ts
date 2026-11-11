@@ -8,6 +8,7 @@ export function validateGridConfig(
   domain: Domain,
   resolution: Resolution,
   testBox: TestBox | null,
+  maxCells?: number,
 ): string[] {
   const errors: string[] = [];
   const lengths = [domain.lx, domain.ly, domain.lz];
@@ -22,6 +23,11 @@ export function validateGridConfig(
       errors.push(`${name} must be an integer between 1 and ${MAX_CELLS_PER_AXIS}`);
     }
   });
+
+  const total = counts[0] * counts[1] * counts[2];
+  if (maxCells !== undefined && total > maxCells) {
+    errors.push(`grid has ${total.toLocaleString("en-US")} cells; the server limit is ${maxCells.toLocaleString("en-US")}`);
+  }
 
   if (testBox) {
     "xyz".split("").forEach((axis, a) => {

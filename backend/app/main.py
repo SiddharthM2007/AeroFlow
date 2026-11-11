@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
@@ -16,8 +17,9 @@ from fastapi.responses import JSONResponse
 
 from .engine import EngineError, EngineUnavailable, GridEngine
 from .jobs import JobStore
+from .mesh_io import MeshParseError, prepare_world_mesh
 from .models_store import InvalidModel, ModelStore, inspect_model
-from .schemas import EngineHealth, GridJob, GridJobRequest, Health, ModelInfo
+from .schemas import EngineHealth, GridJob, GridJobRequest, Health, Limits, ModelInfo
 from .settings import Settings, load_settings
 
 
@@ -67,6 +69,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             info.detail = "engine executable not found; see README for build steps"
         return Health(status="ok", engine=info)
 
+    @app.get("/api/limits", response_model=Limits)
+    def limits() -> Limits:
+        return Limits(
+            max_cells=settings.max_cells,
+            max_cells_per_axis=settings.max_cells_per_axis,
+            max_upload_mb=settings.max_upload_bytes // (1024 * 1024),
+            max_triangles=settings.max_triangles,
+        )
+
     @app.post("/api/models", response_model=ModelInfo, status_code=status.HTTP_201_CREATED)
     async def upload_model(file: UploadFile = File(...)) -> ModelInfo:
         filename = file.filename or ""
@@ -106,20 +117,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 f"grid has {res.total:,} cells; the server limit is {settings.max_cells:,} "
                 "(set AEROFLOW_MAX_CELLS to raise it)",
             )
-        if req.model_id is not None and models.get(req.model_id) is None:
+        info = models.get(req.model_id) if req.model_id is not None else None
+        if req.model_id is not None and info is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"model '{req.model_id}' not found")
 
         created = datetime.now(timezone.utc)
+        job_id = uuid.uuid4().hex
         result, error = None, None
+        triangles_file = None
         try:
-            result = await run_in_threadpool(engine.generate, req.engine_config(), req.include_cells)
+            if req.geometry_source == "mesh":
+                triangles_file = await _prepare_mesh(req, job_id)
+            config = req.engine_config(str(triangles_file) if triangles_file else None)
+            result = await run_in_threadpool(engine.generate, config, req.include_cells)
         except EngineUnavailable as exc:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         except EngineError as exc:
             error = {"code": exc.code, "message": exc.message}
+        finally:
+            if triangles_file is not None:
+                triangles_file.unlink(missing_ok=True)
 
         job = GridJob(
-            job_id=uuid.uuid4().hex,
+            job_id=job_id,
             status="failed" if error else "completed",
             created_at=created,
             finished_at=datetime.now(timezone.utc),
@@ -129,6 +149,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         jobs.add(job)
         return job
+
+    async def _prepare_mesh(req: GridJobRequest, job_id: str) -> Path:
+        """Writes the world-space triangle file for a mesh job; returns its path."""
+        assert req.model_id is not None and req.model_transform is not None  # schema-validated
+        if not engine.available():
+            # Fail before the (potentially slow) mesh conversion.
+            raise EngineUnavailable(f"engine executable not found at {engine.path}")
+        info = models.get(req.model_id)
+        raw_path = models.raw_path(req.model_id)
+        if info is None or raw_path is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"model file for '{req.model_id}' is missing")
+        settings.work_dir.mkdir(parents=True, exist_ok=True)
+        out = settings.work_dir / f"{job_id}.aftri"  # generated name; never the client filename
+        try:
+            await run_in_threadpool(
+                prepare_world_mesh,
+                raw_path,
+                info.format,
+                req.model_transform.matrix,
+                settings.max_triangles,
+                out,
+            )
+        except MeshParseError as exc:
+            out.unlink(missing_ok=True)
+            raise HTTPException(422, f"model_id: {exc}") from exc
+        return out
 
     @app.get("/api/grid-jobs/{job_id}", response_model=GridJob)
     def get_grid_job(job_id: str) -> GridJob:

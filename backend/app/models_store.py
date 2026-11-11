@@ -93,6 +93,14 @@ class ModelStore:
         (self.root / f"{model_id}.json").write_text(stored.model_dump_json())
         return stored
 
+    def raw_path(self, model_id: str) -> Path | None:
+        """Path of the stored model file (named by its generated id, never the client name)."""
+        info = self.get(model_id)
+        if info is None:
+            return None
+        path = self.root / f"{model_id}.{info.format}"
+        return path if path.is_file() else None
+
     def get(self, model_id: str) -> ModelInfo | None:
         if not _MODEL_ID_RE.match(model_id):
             return None

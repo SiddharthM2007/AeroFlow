@@ -5,15 +5,18 @@ import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js
 
 export interface LoadedModel {
   name: string;
+  /** Imported geometry; vertex positions are exactly as stored in the file (file units). */
   geometry: BufferGeometry;
-  /** Bounding-box size in file units, before any transform. */
-  size: Vector3;
+  /** Raw bounding-box size in file units. */
+  rawSize: Vector3;
+  /** Raw bounding-box center in file units; used as the transform pivot. */
+  pivot: [number, number, number];
   triangles: number;
 }
 
 /**
- * Parses an STL or OBJ file into a single BufferGeometry, recentred so its
- * bounding-box center is at the local origin (rotation/scale pivot about it).
+ * Parses an STL or OBJ file into a single BufferGeometry. Vertex positions are not modified;
+ * placement is entirely described by the model transform (see transform.ts).
  */
 export async function loadModelFile(file: File): Promise<LoadedModel> {
   const ext = file.name.split(".").pop()?.toLowerCase();
@@ -46,17 +49,15 @@ export async function loadModelFile(file: File): Promise<LoadedModel> {
   const position = geometry.getAttribute("position");
   if (!position || position.count === 0) throw new Error("Model contains no geometry");
 
-  geometry.computeBoundingBox();
-  const box = geometry.boundingBox!;
-  const center = box.getCenter(new Vector3());
-  geometry.translate(-center.x, -center.y, -center.z);
   geometry.computeVertexNormals();
   geometry.computeBoundingBox();
+  const box = geometry.boundingBox!;
 
   return {
     name: file.name,
     geometry,
-    size: box.getSize(new Vector3()),
+    rawSize: box.getSize(new Vector3()),
+    pivot: box.getCenter(new Vector3()).toArray() as [number, number, number],
     triangles: geometry.index ? geometry.index.count / 3 : position.count / 3,
   };
 }

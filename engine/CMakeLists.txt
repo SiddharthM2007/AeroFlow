@@ -28,6 +28,10 @@ add_library(aeroflow_grid
   src/config.cpp
   src/metadata.cpp
   src/base64.cpp
+  src/mesh.cpp
+  src/ray.cpp
+  src/bvh.cpp
+  src/voxelize.cpp
 )
 target_include_directories(aeroflow_grid PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(aeroflow_grid PUBLIC nlohmann_json::nlohmann_json)
@@ -59,6 +63,8 @@ if(AEROFLOW_BUILD_TESTS)
     tests/test_box.cpp
     tests/test_config.cpp
     tests/test_metadata.cpp
+    tests/test_mesh.cpp
+    tests/test_voxelize.cpp
   )
   target_link_libraries(aeroflow_tests PRIVATE aeroflow_grid GTest::gtest_main)
   include(GoogleTest)

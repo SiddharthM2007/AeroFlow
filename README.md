@@ -4,9 +4,10 @@ A browser-based 3D virtual wind tunnel. Users import STL/OBJ models, configure
 the tunnel and computational grid, and (in later milestones) run a custom C++
 incompressible Navier–Stokes solver.
 
-**Current status: Milestone 1, the geometry and computational grid foundation.**
-There is no flow solver and no geometry voxelization yet. Solid/fluid
-classification uses a procedural axis-aligned test box.
+**Current status: Milestone 2B, CAD mesh voxelization.** It builds on Milestone 1 (the grid
+foundation) and 2A (geometry-aware tunnel fitting). The solid/fluid mask comes from
+either a procedural test box or the imported mesh, never both. There is no flow
+solver yet.
 
 ```
 AeroFlow/
@@ -28,6 +29,147 @@ AeroFlow/
 | Linear index | `idx = i + Nx·(j + Ny·k)`, so `i` varies fastest |
 | Cell types | `Fluid = 0`, `Solid = 1`, one byte per cell |
 | Test-box rule | A cell is **Solid** iff its center lies in the half-open box `[min, max)` |
+
+## Model placement (approved for Milestone 2A)
+
+Imported vertex positions are never modified. A model is placed by:
+
+```
+p_world = T(position) · R(rotation) · S(scale) · U(units) · (p_raw − pivot)
+```
+
+| Term | Meaning |
+|---|---|
+| `p_raw` | Vertex as stored in the file, in file units |
+| `pivot` | Center of the raw bounding box, in file units. Rotation and scale happen about it |
+| `U` | Unit conversion to meters: mm 0.001, cm 0.01, m 1, in 0.0254. Always derived from the selected unit, so it never stacks |
+| `S` | User scale per axis, treated as an intentional physical change |
+| `R` | Euler XYZ in degrees, with matrix `R = Rx·Ry·Rz` (the Three.js `"XYZ"` order) |
+| `T` | Position of the pivot in tunnel coordinates, in meters |
+
+Grid jobs can carry a `model_transform` with these parameters plus the composed
+4×4 row-major `matrix` (raw file units → tunnel meters). The backend checks that
+the matrix matches the parameters. `backend/app/transform.py` is the reference
+implementation that the Milestone 2B voxelizer has to match.
+
+**Fit Tunnel to Model** works as follows:
+
+1. Take the model's exact world-space bounding box, computed from every vertex
+   after the full transform.
+2. Set clearances as multiples of `D = max(bx, by, bz)`. Defaults: upstream 2D,
+   downstream 5D, 1.5D on each side (z), 1.5D on top, and 1.5D below. The model
+   floats freely and does not touch the floor.
+3. Keep the current cell spacing `d` exactly: `n = ceil(L_required / d)` and
+   `L = n·d`. The leftover fraction of a cell is split evenly between the two
+   sides of each axis.
+4. Move the model to its new place by changing only `position`. Units, scale and
+   rotation are never changed.
+5. If the result is over the server grid budget (`GET /api/limits`), offer a
+   coarser grid, made by scaling all spacings by the same factor until both the
+   total-cell and per-axis limits are met. The alternative is to apply the
+   tunnel at the current spacing and adjust it by hand.
+6. Reframe the camera on the tunnel and the model.
+
+## Mesh voxelization (approved for Milestone 2B)
+
+**Cell rule.** Cell `(i,j,k)` is **Solid** if and only if its center
+`((i+½)Δx, (j+½)Δy, (k+½)Δz)` is inside the closed mesh. Classification is binary.
+A cell is never marked solid just because the surface passes through part of it.
+The mask format is unchanged: one byte per cell, `idx = i + Nx·(j + Ny·k)`.
+
+**Data flow.**
+
+```
+stored STL/OBJ (file units) --backend: parse (float32, like Three.js), apply validated matrix-->
+  world-space triangles, meters (binary .aftri file) --engine: validate -> BVH -> ray parity--> Grid3D mask
+```
+
+**Backend → engine geometry.** The engine receives triangles already transformed
+into tunnel coordinates in meters, so it applies no further transformation.
+
+- **File format:** `"AFTRI1\0\0"`, then a little-endian `uint64` triangle count,
+  then `n × 9 float64` values.
+- **Engine config:** the file is passed as `{"mesh": {"triangles_file": ...}}`.
+- **Temporary file:** it is named by the job id (never by the client's filename)
+  and deleted after the job.
+- **Matching the viewer:** the backend parses the raw file the same way the viewer
+  does. Coordinates are rounded to float32, OBJ polygons are fan-triangulated, and
+  negative indices are resolved like Three.js. It applies the same row-major matrix
+  in the same order as the frontend. A shared fixture
+  (`fixtures/geometry/box_quads.obj`) checks that both sides produce identical
+  world bounds.
+
+**Algorithm** (`engine/src/voxelize.cpp`):
+
+- **One ray per grid row:** a single +x ray is cast along each `(j,k)` row. The
+  parity for cell `i` is the number of crossings with `x > x_i`, which is the same
+  as casting one ray per cell. Rows and cells outside the mesh bounds are set to
+  Fluid without any tests.
+- **BVH:** splits at the median triangle centroid along the longest axis. Leaf
+  size defaults to 4 (`mesh.bvh_leaf_size`). Traversal is iterative, and the
+  slab ray–box test handles zero direction components.
+- **Ray–triangle test:** Möller–Trumbore with three outcomes: `Hit`, `Miss` or
+  `Ambiguous`. A crossing within a barycentric tolerance (1e-9) of an edge or
+  vertex is Ambiguous, and so is a ray lying in a triangle's plane. Shared edges
+  and vertices therefore fall in the Ambiguous band for *every* adjacent triangle
+  and are never counted twice.
+- **Fallback:** a cell whose parity depends on an ambiguous crossing is recast
+  from its center along six fixed, non-axis-aligned directions. The first ray
+  with no ambiguous hits decides. This is deterministic, with no random jitter.
+- **Surface policy:** a center within `1e-10 × max(domain diagonal, mesh
+  diagonal)` of the surface is **Solid**, and so is the (not observed in tests)
+  case where every fallback direction is ambiguous.
+
+**Validation** (`engine/src/mesh.cpp`). Vertices are welded by **exact**
+coordinate equality.
+
+| Check | Result |
+|---|---|
+| Empty mesh, non-finite coordinates | error |
+| Duplicate triangles | error |
+| Non-manifold edges (shared by more than 2 triangles) | error |
+| Open boundary edges (not watertight) | error, including gaps of 1e-9 m, since there is no tolerance welding |
+| Degenerate (zero-area) triangles | removed, with a warning |
+| Inconsistent winding | warning; classification is unaffected, but no volume is reported |
+| Mesh partly outside the tunnel | warning; the part inside the domain is classified |
+
+**Volume check.** The mesh volume is `V = ⅙ Σ v0·(v1×v2)`. When the mesh is fully
+inside the domain, the result reports `ε_V = |N_solid·ΔxΔyΔz − V| / V`.
+
+**Measured accuracy.** Sphere, r = 0.3 m, 9,024 triangles, unit domain:
+
+| N³ | V error |
+|---|---|
+| 16³ | 3.80 % |
+| 32³ | 1.39 % |
+| 64³ | 0.44 % |
+| 128³ | 0.047 % |
+
+**Measured performance.** Full request on Apple Silicon: upload, Python parse
+and transform, engine run.
+
+| Triangles | Grid | Request | BVH build | Classification |
+|---|---|---|---|---|
+| 65k | 192×128² | 0.11 s | 13 ms | 4 ms |
+| 261k | 192×128² | 0.44 s | 60 ms | 6 ms |
+| 638k | 192×128² | 1.16 s | 157 ms | 8 ms |
+
+Pure-Python parsing and transforming dominates the request time, at about 0.5 µs
+per vertex. On a 9k-triangle sphere at 48³, the BVH runs **648× fewer**
+ray–triangle tests than brute force.
+
+**Known limitations.**
+
+- **Self-intersecting meshes, overlapping shells and multi-body assemblies that
+  interpenetrate:** parity counting gives XOR-like results (overlapping regions
+  become fluid). These cases are *not* detected; repair or union the shells first.
+- **Thin features below the cell size:** they disappear, because only cell centers
+  are sampled. The UI warns when the model's thinnest dimension spans fewer than 4
+  cells.
+- **Open CAD exports with tiny gaps:** these are rejected rather than repaired.
+- **Triangle limit:** 1,000,000 by default (`AEROFLOW_MAX_TRIANGLES`). Python
+  parsing of very large meshes takes seconds.
+- **Engine run time:** limited by the existing `AEROFLOW_ENGINE_TIMEOUT_S`.
 
 ## Prerequisites
 
@@ -60,18 +202,25 @@ Open http://localhost:5173. The Vite dev server proxies `/api` to
 
 ### Using the viewer
 
-1. **Model:** choose an `.stl` or `.obj` file. It is parsed in the browser,
-   recentred on its bounding box, and uploaded to the backend for validation and
-   storage.
+1. **Model:** choose an `.stl` or `.obj` file and set **Model units** (default:
+   millimeters). The panel shows the size from the file and the physical size in
+   meters after the transform.
 2. **Transform:** move, rotate, or scale the model with the on-screen gizmo or
-   the numeric fields. Use **Fit to tunnel** to scale it to about 30% of the
-   smallest tunnel dimension.
-3. **Wind tunnel / Grid resolution:** set `Lx, Ly, Lz` and `nx, ny, nz`. The
+   the numeric fields.
+3. **Fit Tunnel to Model:** set the clearance multipliers, then check and apply
+   the proposed tunnel and grid. If it's over budget, pick the coarser grid or
+   **Adjust manually**. Use **Display → Reframe view** to re-center the camera.
+4. **Wind tunnel / Grid resolution:** set `Lx, Ly, Lz` and `nx, ny, nz`. The
    lattice preview updates live.
-4. **Test solid (box):** set the procedural solid box.
-5. **Generate grid:** the backend runs the engine, and the solid cells are
-   drawn in orange. Use **Display → Slice** to step through one cell layer at a
-   time.
+5. **Solid geometry source:** choose **Procedural box** (set the test box) or
+   **Imported mesh** (voxelize the uploaded model with its current units and
+   transform). A warning appears if the model is poorly resolved; the grid is
+   never refined automatically.
+6. **Generate grid:** the backend runs the engine, and the solid cells are
+   drawn in orange while the imported mesh stays visible. The results show the
+   source, the solid and fluid counts, the spacing and, for meshes, the
+   voxelization time and volume error. Use **Display → Slice** to step through
+   one cell layer at a time.
 
 ## C++ engine
 
@@ -94,7 +243,11 @@ Input config (unknown keys are rejected):
 }
 ```
 
-`test_box` is optional. The output JSON contains `grid` (resolution, domain,
+Use `"mesh": {"triangles_file": "<path>.aftri", "bvh_leaf_size": 4}` instead of
+`test_box` to voxelize a mesh; setting both is an error. `test_box` is optional. A mesh
+job's output also has `geometry_source`, a `mesh` block (validation, bounds,
+volume, volume error) and `voxelization` statistics. An invalid mesh exits with
+code `2` and error code `invalid_mesh`. The output JSON contains `grid` (resolution, domain,
 spacing, cell count/volume, conventions), `classification` (fluid/solid counts
 and, unless `--no-cells` is passed, `data`: base64-encoded uint8 per cell in
 linear-index order), `test_box`, and `warnings`.
@@ -110,16 +263,20 @@ Library layout:
 - `Aabb` and `mark_solid_box` (`box.hpp`): the procedural test solid.
 - `parse_config` (`config.hpp`): strict JSON validation with field-path error
   messages.
-- `build_grid` and `grid_metadata` (`metadata.hpp`): CLI output.
+- `TriangleMesh`, `read_triangle_file`, `validate_mesh`, `signed_volume`
+  (`mesh.hpp`); `Bvh` (`bvh.hpp`); `intersect_ray_triangle` (`ray.hpp`);
+  `voxelize_mesh` (`voxelize.hpp`).
+- `build` and `grid_metadata` (`metadata.hpp`): CLI output.
 
 ## Backend API
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/health` | Service status and engine availability/version |
+| GET | `/api/limits` | Grid budget (`max_cells`, `max_cells_per_axis`), upload limit and `max_triangles` |
 | POST | `/api/models` | Multipart upload (`file`) of `.stl`/`.obj`; validates structure and returns `model_id` and counts |
 | GET | `/api/models/{model_id}` | Uploaded model metadata |
-| POST | `/api/grid-jobs` | Validates the grid config, runs the engine, and returns the job with the result |
+| POST | `/api/grid-jobs` | Validates the grid config, runs the engine, and returns the job with the result. `geometry_source`: `procedural_box` (default, uses `test_box`) or `mesh` (requires `model_id` and `model_transform`; `test_box` must be null) |
 | GET | `/api/grid-jobs/{job_id}` | Fetch a previous job (kept in memory) |
 
 Grid jobs run synchronously, because the engine finishes in milliseconds at
@@ -140,6 +297,7 @@ Environment variables:
 | `AEROFLOW_MAX_CELLS` | `2097152` (128³) | Per-job cell limit (limits the response size) |
 | `AEROFLOW_MAX_CELLS_PER_AXIS` | `512` | Per-axis limit |
 | `AEROFLOW_MAX_UPLOAD_MB` | `100` | Upload size limit |
+| `AEROFLOW_MAX_TRIANGLES` | `1000000` | Triangle limit for mesh voxelization |
 | `AEROFLOW_ENGINE_TIMEOUT_S` | `60` | Engine subprocess timeout |
 
 Interactive docs are served at http://127.0.0.1:8000/docs.
@@ -148,21 +306,21 @@ Interactive docs are served at http://127.0.0.1:8000/docs.
 
 ```bash
 make test                     # everything
-ctest --test-dir engine/build --output-on-failure        # C++: indexing, coordinates, box classification, config validation
-cd backend && .venv/bin/python -m pytest -q              # API validation, uploads, engine round-trip
+ctest --test-dir engine/build --output-on-failure        # C++: grid, config, mesh validation, ray/BVH, voxelization, convergence
+cd backend && .venv/bin/python -m pytest -q              # API validation, uploads, mesh parsing, engine round-trips
 cd frontend && npm test && npm run build                 # TS unit tests + typecheck + production build
 ```
 
 The backend tests that run the engine are skipped if `engine/build/aeroflow-grid`
 has not been built.
 
-## Not in Milestone 1
+## Not implemented yet
 
 These are left out deliberately, and each will need decisions from the
 developer:
 
-- Geometry voxelization: classifying cells from the imported mesh, including
-  the inside test and the treatment of partially filled cells
+- Volume fractions or cut cells for partially filled cells. The binary mask stays
+  as it is, and a fraction field would be added alongside it.
 - The Navier–Stokes solver: discretization, variable arrangement, time
   integration, pressure solve
 - Boundary conditions: inlet, outlet, walls, and solid surfaces

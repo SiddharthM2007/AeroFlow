@@ -94,9 +94,10 @@ int main(int argc, char** argv) {
 
   try {
     const aeroflow::GridConfig config = aeroflow::parse_config_text(text);
-    const aeroflow::Grid3D grid = aeroflow::build_grid(config);
+    const aeroflow::BuiltGrid built = aeroflow::build(config);
     const std::string body =
-        aeroflow::grid_metadata(grid, config, opts.include_cells).dump(opts.pretty ? 2 : -1);
+        aeroflow::grid_metadata(built.grid, config, opts.include_cells, built.mesh ? &*built.mesh : nullptr)
+            .dump(opts.pretty ? 2 : -1);
 
     if (opts.output_path.empty()) {
       std::cout << body << '\n';
@@ -105,6 +106,8 @@ int main(int argc, char** argv) {
       if (!out) return report_error(kExitIo, "io", "cannot write output file: " + opts.output_path);
       out << body << '\n';
     }
+  } catch (const aeroflow::MeshError& e) {
+    return report_error(kExitConfig, "invalid_mesh", e.what());
   } catch (const aeroflow::ConfigError& e) {
     return report_error(kExitConfig, "invalid_config", e.what());
   } catch (const std::invalid_argument& e) {

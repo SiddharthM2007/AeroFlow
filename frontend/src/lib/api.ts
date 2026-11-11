@@ -1,3 +1,4 @@
+import type { SerializedTransform } from "./transform";
 import type { Domain, Resolution, TestBox } from "./types";
 
 export interface EngineHealth {
@@ -35,14 +36,47 @@ export interface GridMetadata {
     data?: string;
   };
   test_box: TestBox | null;
+  geometry_source?: "procedural_box" | "mesh" | "none";
+  mesh?: MeshResult;
+  voxelization?: VoxelizationStats;
   warnings: string[];
+}
+
+export interface MeshResult {
+  input_triangles: number;
+  triangles: number;
+  degenerate_removed: number;
+  watertight: boolean;
+  consistently_oriented: boolean;
+  bounds: { min: [number, number, number]; max: [number, number, number] };
+  inside_domain: boolean;
+  volume: number | null;
+  voxel_volume: number;
+  volume_relative_error: number | null;
+}
+
+export interface VoxelizationStats {
+  triangles: number;
+  cells_classified: number;
+  rays_cast: number;
+  ray_triangle_tests: number;
+  ambiguous_crossings: number;
+  fallback_cells: number;
+  surface_cells: number;
+  unresolved_cells: number;
+  bvh_nodes: number;
+  bvh_build_ms: number;
+  classify_ms: number;
 }
 
 export interface GridJobRequest {
   domain: Domain;
   resolution: Resolution;
+  geometry_source: "procedural_box" | "mesh";
   test_box: TestBox | null;
   model_id?: string | null;
+  /** World placement of the uploaded model; requires model_id. */
+  model_transform?: SerializedTransform | null;
   include_cells?: boolean;
 }
 
@@ -79,6 +113,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function getHealth(): Promise<{ status: "ok"; engine: EngineHealth }> {
   return request("/api/health");
+}
+
+export interface Limits {
+  max_cells: number;
+  max_cells_per_axis: number;
+  max_upload_mb: number;
+  max_triangles: number;
+}
+
+export function getLimits(): Promise<Limits> {
+  return request("/api/limits");
 }
 
 export function uploadModel(file: File): Promise<ModelInfo> {
