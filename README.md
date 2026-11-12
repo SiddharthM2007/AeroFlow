@@ -11,6 +11,8 @@ mesh voxelization) and 3A (staggered MAC grid and discrete divergence).
 - **Field pipeline:** numerical fields now travel from C++ through FastAPI to the
   browser in a versioned binary format (AFFIELD).
 - **Viewer:** fields are shown as colored 3D slices with a legend.
+- **Boundary conditions (3B):** the C++ MAC grid has reusable boundary-condition
+  operators for the future solver.
 - **First field:** a *divergence diagnostic* of an initialized velocity field.
   There is no advection, diffusion, pressure solve or time stepping yet, so
   nothing shown is a solved airflow.
@@ -260,6 +262,82 @@ div = (u(i+1,j,k) − u(i,j,k))/dx + (v(i,j+1,k) − v(i,j,k))/dy + (w(i,j,k+1) 
 
 - **Masks:** face classification is checked against brute-force cell adjacency
   on a voxelized sphere and on the procedural box.
+
+## MAC boundary conditions (approved for Milestone 3B)
+
+The code is in `engine/include/aeroflow/boundary.hpp` and `src/boundary.cpp`.
+It is not used by the CLI or UI yet; it is the interface for the pressure
+projection and time stepping to come.
+
+**Model** (fixed walls; only `U_in` is configurable, default 5 m/s, finite and ≥ 0):
+
+| Boundary | Normal velocity | Tangential velocity | Pressure |
+|---|---|---|---|
+| Inlet, x = 0 | `u = U_in` (Dirichlet) | 0 (odd reflection) | Neumann |
+| Outlet, x = Lx | pressure-controlled; predictor `u(Nx) = u(Nx−1)` | zero gradient (even reflection) | **Dirichlet p = 0 on the outlet plane** |
+| y = 0, Ly, z = 0, Lz | 0 (free-slip) | zero normal derivative (even reflection) | Neumann |
+| Obstacles (mesh or box) | 0 (no penetration, stationary) | 0, no-slip (odd reflection) | Neumann |
+
+**Face roles.** `classify_boundaries(mask)` reuses `classify_faces` and the face's
+position to give every `u`, `v` and `w` face exactly one `VelocityFaceBC`:
+`Interior`, `Inlet`, `Outlet`, `SlipWall`, `SolidWall` or `Inactive`.
+
+- **No corner conflicts for normal velocity:** a face has one normal direction, so
+  it lies on at most one wall (`u` only on the x walls, `v` on y, `w` on z).
+- **Solids win:** where a solid touches a tunnel wall, the face is `Inactive`, not
+  inlet, outlet or slip wall.
+- **Fully solid domain or blocked outlet:** rejected by `validate_boundaries`.
+  With no `Outlet` face, the pressure has no reference and inflow cannot leave.
+
+**Applying velocities.** `apply_velocity_bcs(mac, map, bc)` writes only
+boundary-controlled faces.
+
+- **Interior faces:** never modified.
+- **Order:** prescribed faces are set first; then outlet faces copy the opposite
+  face of their cell.
+- **Idempotent:** applying it twice gives the same result.
+
+**Tangential conditions.** No sample lies on a wall, so these conditions can't be
+stored. Instead, `tangential_neighbor(mac, map, component, i, j, k, axis, side)`
+returns the neighbor a future viscous or advective stencil needs, or a ghost value
+mirrored about the boundary halfway between samples:
+
+- **+value:** free-slip walls and the outlet.
+- **−value:** the inlet (zero transverse velocity) and `Inactive` obstacle
+  neighbors (no-slip).
+- **Stair-step obstacles:** a neighbor face lying on an obstacle face
+  (`SolidWall`) is returned as stored (0). At stair-step corners the wall is then
+  taken at that sample, not halfway.
+- **Accuracy:** no-slip is imposed on **voxel faces**, not on the CAD surface, so
+  near curved bodies the wall position has an O(Δ) stair-step error. Cut-cell or
+  immersed-boundary methods would be needed to remove it.
+
+**Pressure for the projection.**
+
+- **Unknowns:** one pressure per fluid cell.
+- **`pressure_condition(bc)`:**
+  - `Interior` faces are `Coupled`; the projection corrects their velocity.
+  - `Outlet` faces are `Dirichlet`. The ghost is `outlet_ghost_pressure(p) = −p`,
+    so p = 0 exactly on the outlet plane, and the velocity is corrected with it.
+  - All prescribed faces are `Neumann`: left out of the Laplacian and never
+    corrected, so the inlet, wall and obstacle values survive the projection.
+- **Gauge:** fixed by the outlet Dirichlet faces.
+
+**Diagnostics.** `boundary_fluxes` reports inlet and outlet volume flux, open
+areas, and total leakage through walls and obstacles, which must be 0 after
+`apply_velocity_bcs`.
+
+**Not yet enforceable.**
+
+- **Tangential and outlet derivative conditions:** they act only through ghost
+  values, so they take effect when viscous and advective stencils exist.
+- **Outlet mass balance:** the outlet velocity is final only after a projection.
+  Without one, outflow equals inflow only for flows that are already
+  divergence-free.
+- **Convective outflow:** a convective (radiation) outflow condition needs a time
+  step and is deferred.
+- **Floor:** ground-plane (no-slip floor) runs are not supported. All four lateral
+  walls are free-slip, matching the free-stream tunnel fitting from 2A.
 
 ## Numerical fields and visualization (approved for Milestone 4A)
 
@@ -513,7 +591,7 @@ Interactive docs are served at http://127.0.0.1:8000/docs.
 
 ```bash
 make test                     # everything
-ctest --test-dir engine/build --output-on-failure        # C++: grid, mesh, ray/BVH, voxelization, MAC grid, divergence, AFFIELD
+ctest --test-dir engine/build --output-on-failure        # C++: grid, mesh, ray/BVH, voxelization, MAC grid, divergence, BCs, AFFIELD
 cd backend && .venv/bin/python -m pytest -q              # API validation, uploads, mesh parsing, engine round-trips
 cd frontend && npm test && npm run build                 # TS unit tests + typecheck + production build
 ```
@@ -532,7 +610,7 @@ developer:
   integration, pressure solve
 - Boundary conditions: inlet, outlet, walls, and solid surfaces
 - Non-uniform or refined grids
-- Milestone 3B onward: physical boundary conditions on `SolidBoundary` and
-  `DomainBoundary` faces, advection, diffusion, pressure projection, time stepping
+- Advection, diffusion, pressure projection and time stepping (which will consume
+  the 3B boundary operators)
 - Pressure, velocity, vorticity, vector-arrow, streamline and multi-frame renderers
   (the field format and pipeline already support them)
