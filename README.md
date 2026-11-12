@@ -4,10 +4,12 @@ A browser-based 3D virtual wind tunnel. Users import STL/OBJ models, configure
 the tunnel and computational grid, and (in later milestones) run a custom C++
 incompressible Navier–Stokes solver.
 
-**Current status: Milestone 2B, CAD mesh voxelization.** It builds on Milestone 1 (the grid
-foundation) and 2A (geometry-aware tunnel fitting). The solid/fluid mask comes from
-either a procedural test box or the imported mesh, never both. There is no flow
-solver yet.
+**Current status: Milestone 3A, staggered MAC grid and discrete divergence.** It
+builds on Milestone 1 (the grid foundation), 2A (geometry-aware tunnel fitting)
+and 2B (CAD mesh voxelization). The C++ engine now has the data structures for an
+incompressible solver: staggered velocity and pressure fields, face classification
+and a divergence operator. There is no advection, diffusion, pressure solve or
+time stepping yet.
 
 ```
 AeroFlow/
@@ -171,6 +173,90 @@ ray–triangle tests than brute force.
   parsing of very large meshes takes seconds.
 - **Engine run time:** limited by the existing `AEROFLOW_ENGINE_TIMEOUT_S`.
 
+## Staggered MAC grid (approved for Milestone 3A)
+
+The engine code is in `engine/include/aeroflow/mac_grid.hpp` and
+`divergence.hpp`. It is not used by the CLI, backend or frontend yet.
+
+**Field placement.** `MacGrid` covers the same cells as `Grid3D`, built with
+`MacGrid(grid)`. The spacing `dx = Lx/Nx` is computed with the same expression,
+so pressure positions equal `Grid3D::cell_center` bit for bit.
+
+| Field | Extents | Location (m) |
+|---|---|---|
+| `p(i,j,k)` | `Nx × Ny × Nz` | `((i+½)dx, (j+½)dy, (k+½)dz)`, cell centers |
+| `u(i,j,k)` | `(Nx+1) × Ny × Nz` | `(i·dx, (j+½)dy, (k+½)dz)`, x-faces |
+| `v(i,j,k)` | `Nx × (Ny+1) × Nz` | `((i+½)dx, j·dy, (k+½)dz)`, y-faces |
+| `w(i,j,k)` | `Nx × Ny × (Nz+1)` | `((i+½)dx, (j+½)dy, k·dz)`, z-faces |
+
+**Storage.**
+
+- Each field is a separate contiguous `std::vector<double>` (`StaggeredArray`),
+  indexed x-fastest with its own extents: `idx = i + n0·(j + n1·k)`.
+- Cell `(i,j,k)` is bounded by `u(i)`/`u(i+1)`, `v(j)`/`v(j+1)` and `w(k)`/`w(k+1)`.
+- `at()` is bounds-checked; `operator()` is not.
+
+**Allocation guard.** Sizes are computed with overflow checks. Grids larger than
+`Grid3D`'s 512³ cells are rejected. The four fields together may not exceed a
+byte limit, 2 GiB by default and configurable per grid. At about 32 bytes per
+cell, 256³ fits and 512³ is rejected before anything is allocated.
+
+**Face classification.** `classify_faces(mask)` returns arrays shaped exactly
+like `u`, `v` and `w`.
+
+| Cells on either side | `FaceType` | Active |
+|---|---|---|
+| fluid \| fluid | `Fluid` | yes |
+| fluid \| solid | `SolidBoundary` (obstacle wall) | no |
+| solid \| solid | `SolidInterior` | no |
+| tunnel wall \| fluid | `DomainBoundary` (tunnel wall) | yes |
+| tunnel wall \| solid | `SolidInterior` (tunnel wall covered by the obstacle) | no |
+
+Obstacle walls and tunnel walls are never conflated. No physical boundary
+conditions are applied yet.
+
+**Initialization.**
+
+- `set_zero()`: zero velocity and zero pressure.
+- `set_uniform_velocity(v, FaceSelection::All)`: sets every face. This is a test
+  utility only.
+- `set_uniform_velocity(v, FaceSelection::ActiveOnly, &faces)`: writes `0.0` to
+  blocked faces. That is *not* an obstacle boundary condition.
+
+**Divergence.** `compute_divergence(mac, mask)` returns a cell-centered field.
+For each fluid cell:
+
+```
+div = (u(i+1,j,k) − u(i,j,k))/dx + (v(i,j+1,k) − v(i,j,k))/dy + (w(i,j,k+1) − w(i,j,k))/dz
+```
+
+- **Solid cells:** they hold `0.0`, with no physical meaning; a value is valid
+  only where the mask is Fluid.
+- **Face values:** used as stored. The operator never alters them.
+- **Statistics:** `divergence_stats` returns max |div|, mean |div|, RMS and the
+  fluid-cell count, or `std::nullopt` when there are no fluid cells.
+- **Measuring only:** nothing in this milestone corrects divergence.
+
+**Validation** (`engine/tests/test_mac_grid.cpp`, `test_divergence.cpp`):
+
+- **Exact results:** zero and uniform fields give exactly 0. A linear field
+  `(ax, by, cz)` gives `a+b+c` to 1e-12 with `dx=0.3, dy=0.7, dz=1.1`. The rotation
+  field `(ay, −ax, 0)` gives less than 1e-13.
+- **Stream function:** the discrete curl of an arbitrary stream function is
+  divergence-free to roundoff (below 1e-11).
+- **Truncation error:** the sampled field `u = sin x cos y, v = −cos x sin y` with
+  `dx ≠ dy` converges at second order:
+
+| N | max \|div\| | observed order |
+|---|---|---|
+| 8 | 2.22e-3 | – |
+| 16 | 5.58e-4 | 1.989 |
+| 32 | 1.40e-4 | 1.997 |
+| 64 | 3.50e-5 | 1.999 |
+
+- **Masks:** face classification is checked against brute-force cell adjacency
+  on a voxelized sphere and on the procedural box.
+
 ## Prerequisites
 
 - CMake ≥ 3.20 and a C++20 compiler (tested with Apple Clang 17)
@@ -306,7 +392,7 @@ Interactive docs are served at http://127.0.0.1:8000/docs.
 
 ```bash
 make test                     # everything
-ctest --test-dir engine/build --output-on-failure        # C++: grid, config, mesh validation, ray/BVH, voxelization, convergence
+ctest --test-dir engine/build --output-on-failure        # C++: grid, config, mesh, ray/BVH, voxelization, MAC grid, divergence
 cd backend && .venv/bin/python -m pytest -q              # API validation, uploads, mesh parsing, engine round-trips
 cd frontend && npm test && npm run build                 # TS unit tests + typecheck + production build
 ```
@@ -325,3 +411,5 @@ developer:
   integration, pressure solve
 - Boundary conditions: inlet, outlet, walls, and solid surfaces
 - Non-uniform or refined grids
+- Milestone 3B onward: physical boundary conditions on `SolidBoundary` and
+  `DomainBoundary` faces, advection, diffusion, pressure projection, time stepping
