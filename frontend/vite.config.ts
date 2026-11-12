@@ -7,6 +7,8 @@ export default defineConfig({
   plugins: [react()],
   // three.js alone is ~1 MB minified; code-splitting is not worth it yet.
   build: { chunkSizeWarningLimit: 1600 },
+  // AFFIELD test fixtures are imported with ?inline in unit tests.
+  assetsInclude: ["**/*.affield"],
   server: {
     proxy: { "/api": { target: apiTarget, changeOrigin: true } },
   },

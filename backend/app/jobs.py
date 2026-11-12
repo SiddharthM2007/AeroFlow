@@ -4,21 +4,27 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 
 from .schemas import GridJob
 
 
 class JobStore:
-    def __init__(self, max_jobs: int) -> None:
+    def __init__(self, max_jobs: int, on_evict: Callable[[str], None] | None = None) -> None:
         self._jobs: OrderedDict[str, GridJob] = OrderedDict()
         self._max = max_jobs
         self._lock = threading.Lock()
+        self._on_evict = on_evict
 
     def add(self, job: GridJob) -> None:
+        evicted = []
         with self._lock:
             self._jobs[job.job_id] = job
             while len(self._jobs) > self._max:
-                self._jobs.popitem(last=False)
+                evicted.append(self._jobs.popitem(last=False)[0])
+        if self._on_evict:
+            for job_id in evicted:
+                self._on_evict(job_id)  # e.g. delete the job's field files
 
     def get(self, job_id: str) -> GridJob | None:
         with self._lock:

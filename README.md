@@ -4,12 +4,16 @@ A browser-based 3D virtual wind tunnel. Users import STL/OBJ models, configure
 the tunnel and computational grid, and (in later milestones) run a custom C++
 incompressible Navier–Stokes solver.
 
-**Current status: Milestone 3A, staggered MAC grid and discrete divergence.** It
-builds on Milestone 1 (the grid foundation), 2A (geometry-aware tunnel fitting)
-and 2B (CAD mesh voxelization). The C++ engine now has the data structures for an
-incompressible solver: staggered velocity and pressure fields, face classification
-and a divergence operator. There is no advection, diffusion, pressure solve or
-time stepping yet.
+**Current status: Milestone 4A, scientific field visualization.** It builds on
+Milestone 1 (the grid foundation), 2A (geometry-aware tunnel fitting), 2B (CAD
+mesh voxelization) and 3A (staggered MAC grid and discrete divergence).
+
+- **Field pipeline:** numerical fields now travel from C++ through FastAPI to the
+  browser in a versioned binary format (AFFIELD).
+- **Viewer:** fields are shown as colored 3D slices with a legend.
+- **First field:** a *divergence diagnostic* of an initialized velocity field.
+  There is no advection, diffusion, pressure solve or time stepping yet, so
+  nothing shown is a solved airflow.
 
 ```
 AeroFlow/
@@ -257,6 +261,123 @@ div = (u(i+1,j,k) − u(i,j,k))/dx + (v(i,j+1,k) − v(i,j,k))/dy + (w(i,j,k+1) 
 - **Masks:** face classification is checked against brute-force cell adjacency
   on a voxelized sphere and on the procedural box.
 
+## Numerical fields and visualization (approved for Milestone 4A)
+
+### AFFIELD v1: canonical binary field file
+
+There is one file per field per frame. The C++ engine writes it
+(`engine/src/field_io.cpp`), FastAPI validates it and serves the same bytes
+(`backend/app/fields.py`), and TypeScript decodes it (`frontend/src/lib/fields/format.ts`).
+
+```
+bytes 0..7     "AFFIELD\0"
+bytes 8..11    uint32 LE format version (1)
+bytes 12..15   uint32 LE header length H
+bytes 16..     UTF-8 JSON header, space-padded so that 16 + H is a multiple of 8
+blocks         at the absolute offsets in header.blocks (8-byte aligned, little-endian):
+               "values" float32, "valid" uint8 (1 = valid sample)
+```
+
+| Header key | Meaning |
+|---|---|
+| `name`, `quantity`, `long_name`, `units` | Unique id (`divergence_diagnostic`), physical quantity, label, units (`1/s`) |
+| `signed` | Quantity may be negative, so the viewer uses a zero-centered diverging map; nonnegative quantities get a sequential map |
+| `kind`, `components` | `scalar`, 1 (vector components are separate staggered scalar fields, see below) |
+| `location` | `cell`, `face_x`, `face_y` or `face_z` |
+| `shape`, `index_order` | Array extents `[n0,n1,n2]` and `i + n0*(j + n1*k)`, always x-fastest and never transposed |
+| `grid` | `resolution`, `origin` `[0,0,0]`, `spacing` `[dx,dy,dz]`, `domain` `[Lx,Ly,Lz]` (m) |
+| `frame` | `{index, time_s, label}`; `index` is in the file name `<name>.f<index>.affield` |
+| `mask`, `provenance` | How validity was derived; `{kind: "diagnostic" | "solution", solved, description, ...}` |
+| `stats` | `valid_count`, `min`, `max`, `max_abs`, `mean_abs`, `rms` over valid samples, computed in **float64** before the values are narrowed to float32. All are `null` when there are no valid samples |
+
+Values are transported as float32, half the size of float64 (8.4 MB at the
+128³ job limit), and stats stay exact. `fixtures/fields/golden_v1.affield` is a
+golden file written by C++ and checked byte for byte by the C++, Python and
+TypeScript tests. Regenerate it only for an intentional format change (and bump
+the version) with `AEROFLOW_UPDATE_GOLDEN=1 engine/build/aeroflow_tests`.
+
+### Divergence diagnostic (`divergence_diagnostic`)
+
+**This is a measurement of an initialized field, not a CFD solution.**
+
+- **Velocity:** a MAC grid is built on the solid mask. `u = 5 m/s` on active
+  x-faces, which are `Fluid` and `DomainBoundary` faces, so the inflow and outflow
+  tunnel walls carry 5 m/s. `v = w = 0`, and faces blocked by solids
+  (`SolidBoundary`, `SolidInterior`) carry 0.
+- **Divergence:** computed at fluid-cell centers; solid cells are invalid.
+- **Without an obstacle:** the field is exactly divergence-free.
+- **With an obstacle:** fluid cells just upstream of an obstacle face read
+  `−5/dx` (sink), and cells just downstream read `+5/dx` (source). Everything else
+  is 0.
+
+### Backend
+
+- **Requesting fields:** `POST /api/grid-jobs` with `"fields": ["divergence_diagnostic"]`.
+  This is opt-in; the default is none.
+- **Job response:** the job's `fields` list holds the validated headers (without
+  block offsets). Large arrays never appear in JSON.
+- **Endpoints:**
+  - `GET /api/grid-jobs/{id}/fields` lists field metadata.
+  - `GET /api/grid-jobs/{id}/fields/{name}?frame=0` returns the raw AFFIELD bytes
+    (`application/octet-stream`, `X-AeroFlow-Field-Version: 1`).
+  - Errors: `404` if the job or field doesn't exist (the message lists what is
+    available), `410` if the data was removed.
+- **Validation:** magic, version, JSON header, shape against location and grid,
+  dtypes, block bounds and lengths.
+- **Storage:** files live in `data/jobs/<job_id>/` while the job stays in memory.
+  They are deleted when the job is evicted (after the last 50), on failure, and at
+  startup.
+- **Limits:**
+
+  | Variable | Default | Purpose |
+  |---|---|---|
+  | `AEROFLOW_MAX_FIELD_MB` | 64 | Per-file limit, checked against an estimate before the engine runs (`422`) |
+  | `AEROFLOW_MAX_FIELDS_DISK_MB` | 1024 | Total disk budget (`507` when full) |
+
+### Frontend
+
+All field code is generic; nothing is specific to divergence except the export
+checkbox.
+
+- **`lib/fields/format.ts`:** types, `decodeField` (validates everything and
+  reports precise errors), and `encodeField`.
+- **`lib/fields/sampling.ts`:** sample positions for every location,
+  `extractSlice(field, axis, index)`, and the physical plane corners.
+  - **Positions:** a sample sits at `origin + (idx + offset)·d`, where the offset
+    is ½ on cell axes and 0 on a face field's staggered axis.
+  - **Footprint:** each sample covers `[p − d/2, p + d/2]`. A cell-field slice
+    therefore spans exactly `[0, L]`, and a face field's `[−d/2, L + d/2]`.
+  - **Slice axes:** x-slices use (u, v) = (y, z), y-slices (x, z), z-slices (x, y).
+- **`lib/fields/colormap.ts`:** a diverging map (blue / grey / red, centered at 0,
+  default range ±max|v|) and a sequential map (viridis). Values are normalized and
+  clamped, and a degenerate range maps to the neutral color. Invalid samples become
+  transparent RGBA.
+- **`components/FieldSlice.tsx`:** **one quad with a `DataTexture`** per slice
+  (RGBA8, nearest filtering), with one texel per sample and no interpolation. A
+  512×512 slice is a single texture upload.
+- **`components/FieldLegend.tsx` and `components/FieldsPanel.tsx`:** the legend
+  (units, range, slice position, frame, diagnostic badge) and the controls (field
+  selector, X/Y/Z slice, index, auto or manual range, opacity, stats, provenance).
+
+### Extending to future solver output
+
+- **Pressure:** a `cell` field (`signed: true`, Pa) using the same renderer.
+- **Staggered velocity:** exported unchanged as three scalar fields, `u`
+  (`face_x`, shape `(Nx+1)×Ny×Nz`), `v` (`face_y`) and `w` (`face_z`), each with
+  its own active-face `valid` block. They are never resampled into the file.
+- **Derived cell quantities:** computed **in C++** and exported as new `cell`
+  fields with their own provenance.
+  - **Velocity magnitude:** `|U| = sqrt(ū² + v̄² + w̄²)` with face-pair averages
+    `ū = (u(i)+u(i+1))/2` (and likewise for `v̄`, `w̄`), `signed: false`.
+  - **Vorticity magnitude:** from MAC differences averaged to cell centers.
+  - **Documentation:** the exact stencils will be written down when these fields
+    are implemented.
+- **Vector arrows and streamlines:** would consume the cell-averaged velocity
+  fields, or the face fields directly. The AFFIELD format already describes both.
+- **Time frames:** `frame.index` and `time_s` in the header, files named
+  `<name>.f<frame>.affield`, and the `?frame=` query parameter. Animation only
+  needs to fetch more frames; the format and storage stay the same.
+
 ## Prerequisites
 
 - CMake ≥ 3.20 and a C++20 compiler (tested with Apple Clang 17)
@@ -392,7 +513,7 @@ Interactive docs are served at http://127.0.0.1:8000/docs.
 
 ```bash
 make test                     # everything
-ctest --test-dir engine/build --output-on-failure        # C++: grid, config, mesh, ray/BVH, voxelization, MAC grid, divergence
+ctest --test-dir engine/build --output-on-failure        # C++: grid, mesh, ray/BVH, voxelization, MAC grid, divergence, AFFIELD
 cd backend && .venv/bin/python -m pytest -q              # API validation, uploads, mesh parsing, engine round-trips
 cd frontend && npm test && npm run build                 # TS unit tests + typecheck + production build
 ```
@@ -413,3 +534,5 @@ developer:
 - Non-uniform or refined grids
 - Milestone 3B onward: physical boundary conditions on `SolidBoundary` and
   `DomainBoundary` faces, advection, diffusion, pressure projection, time stepping
+- Pressure, velocity, vorticity, vector-arrow, streamline and multi-frame renderers
+  (the field format and pipeline already support them)

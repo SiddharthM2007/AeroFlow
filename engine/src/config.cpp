@@ -5,6 +5,9 @@
 #include <initializer_list>
 #include <string_view>
 
+#include <algorithm>
+
+#include "aeroflow/field_export.hpp"
 #include "aeroflow/grid3d.hpp"
 
 namespace aeroflow {
@@ -113,11 +116,38 @@ MeshSource parse_mesh(const json& obj) {
   return mesh;
 }
 
+FieldsRequest parse_fields(const json& obj) {
+  const std::string path = "fields";
+  if (!obj.is_object()) fail(path, "must be an object or null");
+  reject_unknown_keys(obj, {"output_dir", "requested"}, path);
+  FieldsRequest fields;
+  const auto dir = obj.find("output_dir");
+  if (dir == obj.end() || !dir->is_string() || dir->get<std::string>().empty()) {
+    fail(path + ".output_dir", "must be a non-empty string");
+  }
+  fields.output_dir = dir->get<std::string>();
+  const auto requested = obj.find("requested");
+  if (requested == obj.end() || !requested->is_array()) fail(path + ".requested", "must be an array of field ids");
+  const auto known = known_field_ids();
+  for (const auto& id : *requested) {
+    if (!id.is_string()) fail(path + ".requested", "must contain only strings");
+    const auto name = id.get<std::string>();
+    if (std::find(known.begin(), known.end(), name) == known.end()) {
+      fail(path + ".requested", "unknown field id '" + name + "'");
+    }
+    if (std::find(fields.requested.begin(), fields.requested.end(), name) != fields.requested.end()) {
+      fail(path + ".requested", "duplicate field id '" + name + "'");
+    }
+    fields.requested.push_back(name);
+  }
+  return fields;
+}
+
 }  // namespace
 
 GridConfig parse_config(const json& root) {
   if (!root.is_object()) throw ConfigError("config: top-level value must be a JSON object");
-  reject_unknown_keys(root, {"domain", "resolution", "test_box", "mesh"}, "");
+  reject_unknown_keys(root, {"domain", "resolution", "test_box", "mesh", "fields"}, "");
 
   GridConfig config;
 
@@ -148,6 +178,9 @@ GridConfig parse_config(const json& root) {
       fail("mesh", "test_box and mesh are mutually exclusive; choose one geometry source");
     }
     config.mesh = parse_mesh(*it);
+  }
+  if (const auto it = root.find("fields"); it != root.end() && !it->is_null()) {
+    config.fields = parse_fields(*it);
   }
   return config;
 }

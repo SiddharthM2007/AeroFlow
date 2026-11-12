@@ -4,6 +4,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -24,6 +25,12 @@ struct MeshSource {
   std::size_t bvh_leaf_size = 4;
 };
 
+// Numerical fields to export as AFFIELD files (see field_io.hpp / field_export.hpp).
+struct FieldsRequest {
+  std::string output_dir;
+  std::vector<std::string> requested;
+};
+
 struct GridConfig {
   std::size_t nx{0};
   std::size_t ny{0};
@@ -34,6 +41,7 @@ struct GridConfig {
   // Geometry sources are mutually exclusive; at most one is set.
   std::optional<Aabb> test_box;
   std::optional<MeshSource> mesh;
+  std::optional<FieldsRequest> fields;
 };
 
 // Expected shape:
@@ -43,6 +51,7 @@ struct GridConfig {
 //   "test_box":   {"min": [x, y, z], "max": [x, y, z]},  // optional, procedural solid
 //   "mesh":       {"triangles_file": "...", "bvh_leaf_size": 4}  // optional, imported mesh
 // }
+//   "fields":     {"output_dir": "...", "requested": ["divergence_diagnostic"]}  // optional
 // "test_box" and "mesh" are mutually exclusive.
 // Unknown keys are rejected so typos do not pass silently.
 GridConfig parse_config(const nlohmann::json& root);

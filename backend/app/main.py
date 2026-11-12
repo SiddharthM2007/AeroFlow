@@ -13,9 +13,10 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from .engine import EngineError, EngineUnavailable, GridEngine
+from .fields import FIELD_MEDIA_TYPE, FieldFileError, FieldStore, estimate_field_bytes
 from .jobs import JobStore
 from .mesh_io import MeshParseError, prepare_world_mesh
 from .models_store import InvalidModel, ModelStore, inspect_model
@@ -39,7 +40,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     engine = GridEngine(settings.engine_path, settings.engine_timeout_s)
     models = ModelStore(settings.models_dir)
-    jobs = JobStore(settings.max_jobs_retained)
+    field_store = FieldStore(settings.jobs_dir, settings.max_fields_disk_bytes)
+    field_store.reset()  # jobs are in-memory; field files from a previous run are orphans
+    jobs = JobStore(settings.max_jobs_retained, on_evict=field_store.remove)
 
     app = FastAPI(title="AeroFlow API", version="0.1.0")
     app.state.settings = settings
@@ -76,6 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             max_cells_per_axis=settings.max_cells_per_axis,
             max_upload_mb=settings.max_upload_bytes // (1024 * 1024),
             max_triangles=settings.max_triangles,
+            max_field_mb=settings.max_field_bytes // (1024 * 1024),
         )
 
     @app.post("/api/models", response_model=ModelInfo, status_code=status.HTTP_201_CREATED)
@@ -120,16 +124,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         info = models.get(req.model_id) if req.model_id is not None else None
         if req.model_id is not None and info is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"model '{req.model_id}' not found")
+        if req.fields:
+            per_field = estimate_field_bytes(res.total)
+            if per_field > settings.max_field_bytes:
+                raise HTTPException(
+                    422,
+                    f"each field would be about {per_field / 2**20:.1f} MB; the limit is "
+                    f"{settings.max_field_bytes // 2**20} MB (set AEROFLOW_MAX_FIELD_MB to raise it)",
+                )
+            if not field_store.has_room_for(per_field * len(req.fields)):
+                raise HTTPException(
+                    status.HTTP_507_INSUFFICIENT_STORAGE,
+                    "field storage budget is full (AEROFLOW_MAX_FIELDS_DISK_MB); older jobs' "
+                    "fields are released as jobs are evicted",
+                )
 
         created = datetime.now(timezone.utc)
         job_id = uuid.uuid4().hex
-        result, error = None, None
+        result, error, field_headers = None, None, []
         triangles_file = None
+        keep_fields = False
         try:
             if req.geometry_source == "mesh":
                 triangles_file = await _prepare_mesh(req, job_id)
-            config = req.engine_config(str(triangles_file) if triangles_file else None)
+            fields_dir = str(field_store.job_dir(job_id).resolve()) if req.fields else None
+            config = req.engine_config(str(triangles_file) if triangles_file else None, fields_dir)
             result = await run_in_threadpool(engine.generate, config, req.include_cells)
+            if req.fields:
+                try:
+                    field_headers = field_store.register(
+                        job_id, result.get("fields", []), req.resolution.model_dump(), settings.max_field_bytes
+                    )
+                    keep_fields = True
+                except FieldFileError as exc:
+                    error = {"code": "invalid_field", "message": str(exc)}
         except EngineUnavailable as exc:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         except EngineError as exc:
@@ -137,6 +165,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             if triangles_file is not None:
                 triangles_file.unlink(missing_ok=True)
+            if req.fields and not keep_fields:
+                field_store.remove(job_id)  # failed or rejected: no partial field files remain
 
         job = GridJob(
             job_id=job_id,
@@ -146,6 +176,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             request=req,
             result=result,
             error=error,
+            fields=field_headers,
         )
         jobs.add(job)
         return job
@@ -175,6 +206,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             out.unlink(missing_ok=True)
             raise HTTPException(422, f"model_id: {exc}") from exc
         return out
+
+    @app.get("/api/grid-jobs/{job_id}/fields")
+    def list_fields(job_id: str) -> dict:
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"grid job '{job_id}' not found")
+        return {"job_id": job_id, "fields": job.fields}
+
+    @app.get("/api/grid-jobs/{job_id}/fields/{name}")
+    def get_field(job_id: str, name: str, frame: int = 0) -> FileResponse:
+        """Binary AFFIELD v1 file (float32 values + uint8 validity); never JSON arrays."""
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"grid job '{job_id}' not found")
+        exported = {(f["name"], f["frame"]["index"]) for f in job.fields}
+        if (name, frame) not in exported:
+            available = ", ".join(f"{n} (frame {i})" for n, i in sorted(exported)) or "none"
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"field '{name}' frame {frame} was not exported for this job; available: {available}",
+            )
+        path = field_store.path(job_id, name, frame)
+        if path is None:
+            raise HTTPException(status.HTTP_410_GONE, f"field '{name}' data is no longer stored")
+        return FileResponse(path, media_type=FIELD_MEDIA_TYPE, headers={"X-AeroFlow-Field-Version": "1"})
 
     @app.get("/api/grid-jobs/{job_id}", response_model=GridJob)
     def get_grid_job(job_id: str) -> GridJob:

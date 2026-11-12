@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { MAX_LATTICE_SEGMENTS } from "./components/GridOverlay";
+import { FieldLegend } from "./components/FieldLegend";
 import { NumberField, Panel, Vec3Field } from "./components/Fields";
+import { FieldsPanel, type FieldViewSettings } from "./components/FieldsPanel";
 import { Viewer } from "./components/Viewer";
 import {
   ApiError,
   createGridJob,
   getHealth,
+  fetchField,
   getLimits,
   uploadModel,
   type GridMetadata,
@@ -32,6 +35,9 @@ import {
   checkModelResolution,
   type GeometrySource,
 } from "./lib/geometrySource";
+import { defaultColormap, defaultRange } from "./lib/fields/colormap";
+import { decodeField, type FieldMetadata, type ScalarFieldData } from "./lib/fields/format";
+import { extractSlice } from "./lib/fields/sampling";
 import { decodeBase64, latticeSegmentCount, makeGridGeometry, type GridGeometry } from "./lib/grid";
 import { loadModelFile, type LoadedModel } from "./lib/loaders";
 import {
@@ -56,6 +62,9 @@ const tunnelBounds = (d: Domain): Bounds => ({ min: [0, 0, 0], max: [d.lx, d.ly,
 type BackendStatus = { state: "checking" } | { state: "ok"; engine: boolean; detail?: string | null } | { state: "down" };
 
 interface GridResult {
+  jobId: string;
+  /** Numerical fields exported with this job (AFFIELD headers). */
+  fields: FieldMetadata[];
   meta: GridMetadata;
   /** Model name when the mask came from the imported mesh. */
   modelName: string | null;
@@ -96,6 +105,53 @@ export default function App() {
   const [result, setResult] = useState<GridResult | null>(null);
   const [jobError, setJobError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [exportDivergence, setExportDivergence] = useState(false);
+
+  // Field visualization: selection, decoded data for the selected field, slice settings.
+  const [selectedField, setSelectedField] = useState<string | null>(null);
+  const [fieldData, setFieldData] = useState<ScalarFieldData | null>(null);
+  const [fieldStatus, setFieldStatus] = useState<{ loading: boolean; error: string | null }>({ loading: false, error: null });
+  const [fieldView, setFieldView] = useState<FieldViewSettings>({
+    visible: true,
+    axis: 2,
+    index: 0,
+    rangeMode: "auto",
+    manual: { min: -1, max: 1 },
+    opacity: 0.9,
+  });
+
+  useEffect(() => {
+    setFieldData(null);
+    if (!result || !selectedField) return;
+    let cancelled = false;
+    setFieldStatus({ loading: true, error: null });
+    fetchField(result.jobId, selectedField)
+      .then((buffer) => {
+        if (cancelled) return;
+        const decoded = decodeField(buffer);
+        setFieldData(decoded);
+        // Start at the middle slice of the current axis.
+        setFieldView((v) => ({ ...v, index: Math.floor(decoded.meta.shape[v.axis] / 2) }));
+        setFieldStatus({ loading: false, error: null });
+      })
+      .catch((e) => !cancelled && setFieldStatus({ loading: false, error: (e as Error).message }));
+    return () => {
+      cancelled = true;
+    };
+  }, [result, selectedField]);
+
+  const fieldColormap = fieldData ? defaultColormap(fieldData.meta) : null;
+  const fieldRange =
+    fieldData && fieldColormap
+      ? fieldView.rangeMode === "auto"
+        ? defaultRange(fieldData.meta, fieldColormap)
+        : fieldView.manual
+      : null;
+  const fieldIndex = fieldData ? Math.min(fieldView.index, fieldData.meta.shape[fieldView.axis] - 1) : 0;
+  const fieldPlane = useMemo(
+    () => (fieldData ? extractSlice(fieldData, fieldView.axis, fieldIndex).planeCoordinate : null),
+    [fieldData, fieldView.axis, fieldIndex],
+  );
 
   useEffect(() => {
     getHealth()
@@ -198,7 +254,9 @@ export default function App() {
     const key = requestKey;
     try {
       const mesh = modelInfo && model ? { modelId: modelInfo.model_id, units, pivot: model.pivot, transform } : null;
-      const job = await createGridJob(buildGridJobRequest(geometrySource, domain, resolution, activeBox, mesh));
+      const job = await createGridJob(
+        buildGridJobRequest(geometrySource, domain, resolution, activeBox, mesh, exportDivergence ? ["divergence_diagnostic"] : []),
+      );
       if (job.status !== "completed" || !job.result) {
         throw new ApiError(job.error ? `${job.error.code}: ${job.error.message}` : "grid job failed");
       }
@@ -206,12 +264,15 @@ export default function App() {
       const cells = decodeBase64(meta.classification.data ?? "");
       if (cells.length !== meta.grid.cell_count) throw new ApiError("classification payload has wrong length");
       setResult({
+        jobId: job.job_id,
+        fields: job.fields,
         meta,
         cells,
         key,
         grid: makeGridGeometry(meta.grid.domain, meta.grid.resolution),
         modelName: geometrySource === "mesh" ? (model?.name ?? null) : null,
       });
+      setSelectedField(job.fields[0]?.name ?? null);
     } catch (e) {
       setJobError((e as Error).message);
     } finally {
@@ -411,6 +472,10 @@ export default function App() {
               ))}
             </ul>
           )}
+          <label className="check">
+            <input type="checkbox" checked={exportDivergence} onChange={(e) => setExportDivergence(e.target.checked)} />
+            Export divergence diagnostic field (1/s)
+          </label>
           <button className="primary" disabled={errors.length > 0 || running} onClick={generate}>
             {running ? "Generating…" : "Generate grid"}
           </button>
@@ -449,6 +514,22 @@ export default function App() {
             </div>
           )}
         </Panel>
+
+        {result && result.fields.length > 0 && (
+          <FieldsPanel
+            fields={result.fields}
+            selected={selectedField}
+            onSelect={setSelectedField}
+            data={fieldData}
+            loading={fieldStatus.loading}
+            error={fieldStatus.error}
+            view={fieldView}
+            onViewChange={setFieldView}
+            colormap={fieldColormap}
+            range={fieldRange}
+            planeCoordinate={fieldPlane}
+          />
+        )}
 
         <Panel title="Display">
           <label className="check">
@@ -514,7 +595,29 @@ export default function App() {
           testBox={display.showTestBox ? activeBox : null}
           grid={{ preview, result: result ? { grid: result.grid, cells: result.cells } : null, display }}
           frame={frame}
+          fieldSlice={
+            fieldData && fieldRange && fieldColormap && fieldView.visible
+              ? {
+                  field: fieldData,
+                  axis: fieldView.axis,
+                  index: fieldIndex,
+                  range: fieldRange,
+                  colormap: fieldColormap,
+                  opacity: fieldView.opacity,
+                }
+              : null
+          }
         />
+        {fieldData && fieldRange && fieldColormap && fieldView.visible && fieldPlane !== null && (
+          <FieldLegend
+            meta={fieldData.meta}
+            range={fieldRange}
+            colormap={fieldColormap}
+            axis={fieldView.axis}
+            index={fieldIndex}
+            planeCoordinate={fieldPlane}
+          />
+        )}
       </main>
     </div>
   );

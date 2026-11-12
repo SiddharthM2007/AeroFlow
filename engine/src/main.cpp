@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include "aeroflow/config.hpp"
+#include "aeroflow/field_export.hpp"
 #include "aeroflow/metadata.hpp"
 
 namespace {
@@ -95,9 +96,12 @@ int main(int argc, char** argv) {
   try {
     const aeroflow::GridConfig config = aeroflow::parse_config_text(text);
     const aeroflow::BuiltGrid built = aeroflow::build(config);
-    const std::string body =
-        aeroflow::grid_metadata(built.grid, config, opts.include_cells, built.mesh ? &*built.mesh : nullptr)
-            .dump(opts.pretty ? 2 : -1);
+    nlohmann::json meta =
+        aeroflow::grid_metadata(built.grid, config, opts.include_cells, built.mesh ? &*built.mesh : nullptr);
+    meta["fields"] = config.fields ? aeroflow::export_fields(built.grid, config.fields->requested,
+                                                              config.fields->output_dir)
+                                   : nlohmann::json::array();
+    const std::string body = meta.dump(opts.pretty ? 2 : -1);
 
     if (opts.output_path.empty()) {
       std::cout << body << '\n';
@@ -106,6 +110,8 @@ int main(int argc, char** argv) {
       if (!out) return report_error(kExitIo, "io", "cannot write output file: " + opts.output_path);
       out << body << '\n';
     }
+  } catch (const aeroflow::FieldError& e) {
+    return report_error(kExitIo, "field_export", e.what());
   } catch (const aeroflow::MeshError& e) {
     return report_error(kExitConfig, "invalid_mesh", e.what());
   } catch (const aeroflow::ConfigError& e) {

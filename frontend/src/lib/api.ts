@@ -1,3 +1,4 @@
+import type { FieldMetadata } from "./fields/format";
 import type { SerializedTransform } from "./transform";
 import type { Domain, Resolution, TestBox } from "./types";
 
@@ -78,13 +79,19 @@ export interface GridJobRequest {
   /** World placement of the uploaded model; requires model_id. */
   model_transform?: SerializedTransform | null;
   include_cells?: boolean;
+  /** Numerical fields to export (opt-in), e.g. ["divergence_diagnostic"]. */
+  fields?: FieldId[];
 }
+
+export type FieldId = "divergence_diagnostic";
 
 export interface GridJob {
   job_id: string;
   status: "completed" | "failed";
   result: GridMetadata | null;
   error: { code: string; message: string } | null;
+  /** Validated AFFIELD headers; data via fetchField(). */
+  fields: FieldMetadata[];
 }
 
 export class ApiError extends Error {}
@@ -130,6 +137,21 @@ export function uploadModel(file: File): Promise<ModelInfo> {
   const form = new FormData();
   form.append("file", file);
   return request("/api/models", { method: "POST", body: form });
+}
+
+/** Raw AFFIELD bytes for one exported field (decode with decodeField). */
+export async function fetchField(jobId: string, name: string, frame = 0): Promise<ArrayBuffer> {
+  let resp: Response;
+  try {
+    resp = await fetch(`/api/grid-jobs/${encodeURIComponent(jobId)}/fields/${encodeURIComponent(name)}?frame=${frame}`);
+  } catch {
+    throw new ApiError("Cannot reach the AeroFlow backend. Is it running on port 8000?");
+  }
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => null);
+    throw new ApiError(typeof body?.detail === "string" ? body.detail : `Field request failed (${resp.status})`);
+  }
+  return resp.arrayBuffer();
 }
 
 export function createGridJob(req: GridJobRequest): Promise<GridJob> {

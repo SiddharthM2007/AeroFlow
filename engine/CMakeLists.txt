@@ -34,6 +34,8 @@ add_library(aeroflow_grid
   src/voxelize.cpp
   src/mac_grid.cpp
   src/divergence.cpp
+  src/field_io.cpp
+  src/field_export.cpp
 )
 target_include_directories(aeroflow_grid PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(aeroflow_grid PUBLIC nlohmann_json::nlohmann_json)
@@ -69,8 +71,10 @@ if(AEROFLOW_BUILD_TESTS)
     tests/test_voxelize.cpp
     tests/test_mac_grid.cpp
     tests/test_divergence.cpp
+    tests/test_fields.cpp
   )
   target_link_libraries(aeroflow_tests PRIVATE aeroflow_grid GTest::gtest_main)
+  target_compile_definitions(aeroflow_tests PRIVATE AEROFLOW_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../fixtures")
   include(GoogleTest)
   gtest_discover_tests(aeroflow_tests)
 endif()

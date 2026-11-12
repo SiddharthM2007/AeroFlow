@@ -6,6 +6,7 @@ import { frameBounds } from "../lib/camera";
 import type { LoadedModel } from "../lib/loaders";
 import { UNIT_TO_METERS, type Bounds, type LengthUnit } from "../lib/transform";
 import type { Domain, GizmoMode, ModelTransform, TestBox } from "../lib/types";
+import { FieldSlice, type FieldSliceProps } from "./FieldSlice";
 import { GridOverlay, type GridOverlayProps } from "./GridOverlay";
 
 interface ViewerProps {
@@ -18,6 +19,8 @@ interface ViewerProps {
   modelOpacity: number;
   testBox: TestBox | null;
   grid: GridOverlayProps;
+  /** Scalar field slice to draw, if any. */
+  fieldSlice: FieldSliceProps | null;
   /** Camera framing request; a new `id` re-frames the camera onto `bounds`. */
   frame: { id: number; bounds: Bounds };
 }
@@ -49,6 +52,7 @@ export function Viewer(props: ViewerProps) {
         />
       )}
       <GridOverlay {...props.grid} />
+      {props.fieldSlice && <FieldSlice {...props.fieldSlice} />}
 
       <axesHelper args={[span * 0.15]} />
       <OrbitControls makeDefault />

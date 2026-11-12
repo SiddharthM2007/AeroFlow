@@ -55,6 +55,7 @@ h1 {
 .viewport {
   flex: 1;
   min-width: 0;
+  position: relative;
 }
 
 .panel {
@@ -266,4 +267,74 @@ input[type="range"] {
 
 .field.units {
   margin: 8px 0 4px;
+}
+
+.diagnostic-note {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--warn);
+  border-left: 2px solid var(--warn);
+  padding-left: 8px;
+  margin: 8px 0;
+}
+
+.field-legend {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  width: 300px;
+  padding: 10px 12px 12px;
+  background: rgba(22, 27, 34, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.legend-badge {
+  display: inline-block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: 3px;
+  padding: 1px 6px;
+  margin-bottom: 6px;
+}
+
+.legend-title {
+  margin-bottom: 6px;
+}
+
+.legend-bar {
+  height: 12px;
+  border-radius: 2px;
+}
+
+.legend-ticks {
+  position: relative;
+  height: 16px;
+  margin-top: 2px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+}
+
+.legend-ticks span {
+  position: absolute;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.legend-ticks span:first-child {
+  transform: none;
+}
+
+.legend-ticks span:last-child {
+  transform: translateX(-100%);
+}
+
+.legend-meta {
+  font-size: 11px;
+  margin-top: 4px;
 }

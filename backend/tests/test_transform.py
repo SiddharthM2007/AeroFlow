@@ -74,6 +74,7 @@ def test_limits_endpoint(client: TestClient, settings) -> None:
         "max_cells_per_axis": settings.max_cells_per_axis,
         "max_upload_mb": settings.max_upload_bytes // (1024 * 1024),
         "max_triangles": settings.max_triangles,
+        "max_field_mb": settings.max_field_bytes // (1024 * 1024),
     }
 
 

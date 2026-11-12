@@ -1,6 +1,6 @@
 // Geometry source for the solid-cell mask (Milestone 2B). The procedural box and the imported
 // mesh are mutually exclusive; a request never carries both.
-import type { GridJobRequest } from "./api";
+import type { FieldId, GridJobRequest } from "./api";
 import { boundsSize, serializeTransform, type Bounds, type LengthUnit } from "./transform";
 import type { Domain, ModelTransform, Resolution, TestBox, Vec3 } from "./types";
 
@@ -24,15 +24,24 @@ export function buildGridJobRequest(
   resolution: Resolution,
   testBox: TestBox | null,
   mesh: MeshInput | null,
+  fields: FieldId[] = [],
 ): GridJobRequest {
   const placement = mesh
     ? { model_id: mesh.modelId, model_transform: serializeTransform(mesh.units, mesh.pivot, mesh.transform) }
     : { model_id: null, model_transform: null };
   if (source === "mesh") {
     if (!mesh) throw new Error("imported mesh mode needs an uploaded model");
-    return { domain, resolution, geometry_source: "mesh", test_box: null, ...placement, include_cells: true };
+    return { domain, resolution, geometry_source: "mesh", test_box: null, ...placement, include_cells: true, fields };
   }
-  return { domain, resolution, geometry_source: "procedural_box", test_box: testBox, ...placement, include_cells: true };
+  return {
+    domain,
+    resolution,
+    geometry_source: "procedural_box",
+    test_box: testBox,
+    ...placement,
+    include_cells: true,
+    fields,
+  };
 }
 
 /** Cells spanned by the model's thinnest dimension; below this the shape is poorly resolved. */

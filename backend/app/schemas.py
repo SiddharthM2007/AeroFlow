@@ -21,6 +21,7 @@ CellCount = Annotated[int, Field(ge=1, strict=True)]
 PositiveScale = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 LengthUnit = Literal["mm", "cm", "m", "in"]
 GeometrySource = Literal["procedural_box", "mesh"]
+FieldId = Literal["divergence_diagnostic"]
 
 # Relative tolerance when checking the client's matrix against the parameters.
 MATRIX_RTOL = 1e-9
@@ -114,6 +115,17 @@ class GridJobRequest(StrictModel):
     include_cells: bool = Field(
         default=True, description="Return per-cell classification (base64 uint8)."
     )
+    fields: list[FieldId] = Field(
+        default_factory=list,
+        description="Numerical fields to export as AFFIELD files (opt-in). "
+        "'divergence_diagnostic' is an initialized diagnostic, not a solved flow.",
+    )
+
+    @model_validator(mode="after")
+    def _unique_fields(self) -> GridJobRequest:
+        if len(set(self.fields)) != len(self.fields):
+            raise ValueError("fields: field ids must be unique")
+        return self
 
     @model_validator(mode="after")
     def _transform_needs_model(self) -> GridJobRequest:
@@ -149,9 +161,15 @@ class GridJobRequest(StrictModel):
                 )
         return self
 
-    def engine_config(self, triangles_file: str | None = None) -> dict[str, Any]:
+    def engine_config(
+        self, triangles_file: str | None = None, fields_dir: str | None = None
+    ) -> dict[str, Any]:
         """The JSON document passed to the aeroflow-grid executable."""
         config = self.model_dump(include={"domain", "resolution"}, mode="json")
+        if self.fields:
+            if fields_dir is None:
+                raise ValueError("field export needs an output directory")
+            config["fields"] = {"output_dir": fields_dir, "requested": list(self.fields)}
         if self.geometry_source == "mesh":
             if triangles_file is None:
                 raise ValueError("mesh jobs need a prepared triangles file")
@@ -180,6 +198,8 @@ class GridJob(BaseModel):
     request: GridJobRequest
     result: dict[str, Any] | None = None
     error: dict[str, str] | None = None
+    # Validated AFFIELD headers (without block offsets); data via /api/grid-jobs/{id}/fields/{name}.
+    fields: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class EngineHealth(BaseModel):
@@ -194,6 +214,7 @@ class Limits(BaseModel):
     max_cells_per_axis: int
     max_upload_mb: int
     max_triangles: int
+    max_field_mb: int
 
 
 class Health(BaseModel):

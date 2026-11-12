@@ -18,12 +18,19 @@ class Settings:
     max_cells: int
     max_cells_per_axis: int
     max_triangles: int
+    max_field_bytes: int
+    max_fields_disk_bytes: int
     max_jobs_retained: int
     cors_origins: tuple[str, ...]
 
     @property
     def models_dir(self) -> Path:
         return self.data_dir / "models"
+
+    @property
+    def jobs_dir(self) -> Path:
+        """Per-job numerical field files (AFFIELD), kept while the job is retained."""
+        return self.data_dir / "jobs"
 
     @property
     def work_dir(self) -> Path:
@@ -44,6 +51,8 @@ def load_settings() -> Settings:
         max_cells=int(env.get("AEROFLOW_MAX_CELLS", str(128**3))),
         max_cells_per_axis=int(env.get("AEROFLOW_MAX_CELLS_PER_AXIS", "512")),
         max_triangles=int(env.get("AEROFLOW_MAX_TRIANGLES", "1000000")),
+        max_field_bytes=int(env.get("AEROFLOW_MAX_FIELD_MB", "64")) * 1024 * 1024,
+        max_fields_disk_bytes=int(env.get("AEROFLOW_MAX_FIELDS_DISK_MB", "1024")) * 1024 * 1024,
         max_jobs_retained=int(env.get("AEROFLOW_MAX_JOBS", "50")),
         cors_origins=tuple(
             o.strip()
