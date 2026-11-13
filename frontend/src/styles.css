@@ -338,3 +338,47 @@ input[type="range"] {
   font-size: 11px;
   margin-top: 4px;
 }
+
+.field-requests {
+  margin: 6px 0 8px;
+}
+
+.projection-settings {
+  margin: 4px 0 4px 22px;
+}
+
+.projection-summary {
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+  margin: 6px 0;
+}
+
+.sim-progress progress {
+  width: 100%;
+  margin: 4px 0;
+}
+
+.sim-progress button {
+  margin-top: 4px;
+}
+
+.estimate-bad {
+  border-left: 2px solid var(--error);
+  padding-left: 8px;
+}
+
+.frame-select {
+  margin: 4px 0 6px;
+}
+
+.solver-field {
+  margin: 6px 0 2px;
+}
+
+.solver-field select {
+  width: 100%;
+}
+
+.solver-summary {
+  margin: 2px 0;
+}

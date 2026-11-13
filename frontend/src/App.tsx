@@ -1,17 +1,29 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { MAX_LATTICE_SEGMENTS } from "./components/GridOverlay";
 import { FieldLegend } from "./components/FieldLegend";
 import { NumberField, Panel, Vec3Field } from "./components/Fields";
-import { FieldsPanel, type FieldViewSettings } from "./components/FieldsPanel";
+import { FieldsNotice, FieldsPanel, type FieldViewSettings, type LastJobOutcome } from "./components/FieldsPanel";
+import { PressureSolverField, SimulationProgressView, SimulationSettingsView } from "./components/SimulationControls";
 import { Viewer } from "./components/Viewer";
 import {
   ApiError,
+  cancelGridJob,
   createGridJob,
+  estimateGridJob,
+  FINAL_JOB_STATUSES,
+  getGridJob,
+  SIMULATION_FIELD_IDS,
   getHealth,
+  PROJECTION_FIELD_IDS,
   fetchField,
   getLimits,
   uploadModel,
+  type EstimateResponse,
+  type FieldId,
+  type GridJob,
   type GridMetadata,
+  type SimulationRequest,
+  type ProjectionRequest,
   type MeshResult,
   type ModelInfo,
   type VoxelizationStats,
@@ -39,6 +51,7 @@ import { defaultColormap, defaultRange } from "./lib/fields/colormap";
 import { decodeField, type FieldMetadata, type ScalarFieldData } from "./lib/fields/format";
 import { extractSlice } from "./lib/fields/sampling";
 import { decodeBase64, latticeSegmentCount, makeGridGeometry, type GridGeometry } from "./lib/grid";
+import { browserStorage, loadFieldPrefs, saveFieldPrefs } from "./lib/fieldPrefs";
 import { loadModelFile, type LoadedModel } from "./lib/loaders";
 import {
   UNIT_LABELS,
@@ -56,6 +69,28 @@ const DEFAULT_RESOLUTION: Resolution = { nx: 64, ny: 32, nz: 32 };
 const DEFAULT_BOX: TestBox = { min: [1.0, 0.0, 0.75], max: [1.5, 0.5, 1.25] };
 /** Mirrors the backend defaults; replaced by /api/limits when the backend is reachable. */
 const FALLBACK_LIMITS: GridLimits = { maxCells: 128 ** 3, maxCellsPerAxis: 512 };
+
+/** Exportable fields; the last four come from one pressure projection of the initialized field. */
+const FIELD_OPTIONS: [FieldId, string][] = [
+  ["divergence_diagnostic", "Divergence diagnostic, initialized field (1/s)"],
+  ["pressure", "Pressure after projection (Pa)"],
+  ["divergence_before", "Divergence before projection (1/s)"],
+  ["divergence_after", "Divergence after projection (1/s)"],
+  ["velocity_magnitude", "Velocity magnitude after projection (m/s)"],
+];
+
+/** Time-dependent Navier-Stokes fields (Milestone 6): one AFFIELD file per field per frame. */
+const SIMULATION_FIELD_OPTIONS: [FieldId, string][] = [
+  ["sim_pressure", "Pressure p(t) (Pa)"],
+  ["sim_velocity_magnitude", "Velocity magnitude |u|(t) (m/s)"],
+  ["sim_divergence", "Divergence after projection (1/s)"],
+  ["sim_u", "u(t), x-faces (m/s)"],
+  ["sim_v", "v(t), y-faces (m/s)"],
+  ["sim_w", "w(t), z-faces (m/s)"],
+];
+
+const POLL_INTERVAL_MS = 750;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const tunnelBounds = (d: Domain): Bounds => ({ min: [0, 0, 0], max: [d.lx, d.ly, d.lz] });
 
@@ -105,10 +140,28 @@ export default function App() {
   const [result, setResult] = useState<GridResult | null>(null);
   const [jobError, setJobError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
-  const [exportDivergence, setExportDivergence] = useState(false);
+  // Field selections and projection settings persist across reloads (per-viewer convenience).
+  const [initialPrefs] = useState(() => loadFieldPrefs(browserStorage()));
+  const [requestedFields, setRequestedFields] = useState<FieldId[]>(initialPrefs.fields);
+  const [projectionSettings, setProjectionSettings] = useState<ProjectionRequest>(initialPrefs.projection);
+  const [simulationSettings, setSimulationSettings] = useState<SimulationRequest>(initialPrefs.simulation);
+  useEffect(() => {
+    saveFieldPrefs(browserStorage(), { fields: requestedFields, projection: projectionSettings, simulation: simulationSettings });
+  }, [requestedFields, projectionSettings, simulationSettings]);
+  // The job currently queued/running (simulations are asynchronous), for progress and Cancel.
+  const [activeJob, setActiveJob] = useState<GridJob | null>(null);
+  // Outcome of the most recent Generate, so the Fields panel can explain an empty result.
+  const [lastJob, setLastJob] = useState<LastJobOutcome | null>(null);
+  const toggleField = (id: FieldId, on: boolean) =>
+    setRequestedFields((fs) => (on ? [...fs.filter((f) => f !== id), id] : fs.filter((f) => f !== id)));
+  const projectionRequested = requestedFields.some((f) => PROJECTION_FIELD_IDS.includes(f));
+  const simulationRequested = requestedFields.some((f) => SIMULATION_FIELD_IDS.includes(f));
 
   // Field visualization: selection, decoded data for the selected field, slice settings.
   const [selectedField, setSelectedField] = useState<string | null>(null);
+  const [selectedFrame, setSelectedFrame] = useState(0);
+  // Slice index is reset to the middle only when the field (not the frame) changes.
+  const lastLoadedField = useRef<string | null>(null);
   const [fieldData, setFieldData] = useState<ScalarFieldData | null>(null);
   const [fieldStatus, setFieldStatus] = useState<{ loading: boolean; error: string | null }>({ loading: false, error: null });
   const [fieldView, setFieldView] = useState<FieldViewSettings>({
@@ -125,20 +178,24 @@ export default function App() {
     if (!result || !selectedField) return;
     let cancelled = false;
     setFieldStatus({ loading: true, error: null });
-    fetchField(result.jobId, selectedField)
+    fetchField(result.jobId, selectedField, selectedFrame)
       .then((buffer) => {
         if (cancelled) return;
         const decoded = decodeField(buffer);
         setFieldData(decoded);
-        // Start at the middle slice of the current axis.
-        setFieldView((v) => ({ ...v, index: Math.floor(decoded.meta.shape[v.axis] / 2) }));
+        // Start at the middle slice of the current axis when a different field is shown.
+        const key = `${result.jobId}:${selectedField}`;
+        if (lastLoadedField.current !== key) {
+          lastLoadedField.current = key;
+          setFieldView((v) => ({ ...v, index: Math.floor(decoded.meta.shape[v.axis] / 2) }));
+        }
         setFieldStatus({ loading: false, error: null });
       })
       .catch((e) => !cancelled && setFieldStatus({ loading: false, error: (e as Error).message }));
     return () => {
       cancelled = true;
     };
-  }, [result, selectedField]);
+  }, [result, selectedField, selectedFrame]);
 
   const fieldColormap = fieldData ? defaultColormap(fieldData.meta) : null;
   const fieldRange =
@@ -187,6 +244,30 @@ export default function App() {
     mesh: geometrySource === "mesh" ? { id: modelInfo?.model_id, units, transform } : null,
   });
   const stale = result !== null && result.key !== requestKey;
+  // Preflight estimate for simulation runs (debounced; nothing is run).
+  const jobRequest = useMemo(() => {
+    const mesh = modelInfo && model ? { modelId: modelInfo.model_id, units, pivot: model.pivot, transform } : null;
+    return buildGridJobRequest(geometrySource, domain, resolution, activeBox, mesh, requestedFields, projectionSettings, simulationSettings);
+  }, [geometrySource, domain, resolution, activeBox, modelInfo, model, units, transform, requestedFields, projectionSettings, simulationSettings]);
+  const [estimate, setEstimate] = useState<{ value: EstimateResponse | null; error: string | null }>({ value: null, error: null });
+  const estimateKey = simulationRequested && errors.length === 0 ? JSON.stringify(jobRequest) : null;
+  useEffect(() => {
+    if (!estimateKey) {
+      setEstimate({ value: null, error: null });
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      estimateGridJob(JSON.parse(estimateKey))
+        .then((value) => !cancelled && setEstimate({ value, error: null }))
+        .catch((e) => !cancelled && setEstimate({ value: null, error: (e as Error).message }));
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [estimateKey]);
+
   const fitKey = JSON.stringify({ domain, resolution, units, transform, clearances, limits, model: model?.name });
   const activeProposal = proposal && proposal.key === fitKey ? proposal.fit : null;
 
@@ -252,14 +333,28 @@ export default function App() {
     setRunning(true);
     setJobError(null);
     const key = requestKey;
+    const requested = [...requestedFields];
     try {
-      const mesh = modelInfo && model ? { modelId: modelInfo.model_id, units, pivot: model.pivot, transform } : null;
-      const job = await createGridJob(
-        buildGridJobRequest(geometrySource, domain, resolution, activeBox, mesh, exportDivergence ? ["divergence_diagnostic"] : []),
-      );
-      if (job.status !== "completed" || !job.result) {
+      let job = await createGridJob(jobRequest);
+      // Simulations run asynchronously: poll until the job reaches a final state.
+      while (!FINAL_JOB_STATUSES.includes(job.status)) {
+        setActiveJob(job);
+        await sleep(POLL_INTERVAL_MS);
+        job = await getGridJob(job.job_id);
+      }
+      setActiveJob(null);
+      if (job.status === "cancelled") {
+        setLastJob({ status: "cancelled", requested, error: "the simulation was cancelled; its frames were discarded" });
+        return;
+      }
+      if ((job.status !== "completed" && job.status !== "stopped") || !job.result) {
         throw new ApiError(job.error ? `${job.error.code}: ${job.error.message}` : "grid job failed");
       }
+      setLastJob({
+        status: job.status,
+        requested,
+        error: job.status === "stopped" && job.error ? job.error.message : null,
+      });
       const meta = job.result;
       const cells = decodeBase64(meta.classification.data ?? "");
       if (cells.length !== meta.grid.cell_count) throw new ApiError("classification payload has wrong length");
@@ -273,10 +368,23 @@ export default function App() {
         modelName: geometrySource === "mesh" ? (model?.name ?? null) : null,
       });
       setSelectedField(job.fields[0]?.name ?? null);
+      setSelectedFrame(0);
     } catch (e) {
       setJobError((e as Error).message);
+      setLastJob({ status: "failed", requested, error: (e as Error).message });
     } finally {
+      setActiveJob(null);
       setRunning(false);
+    }
+  }
+
+  async function cancelActiveJob() {
+    if (!activeJob) return;
+    try {
+      await cancelGridJob(activeJob.job_id);
+    } catch (e) {
+      // 409: it finished in the meantime; the poll loop picks up the final state.
+      if (!(e instanceof ApiError && /already/.test(e.message))) setJobError((e as Error).message);
     }
   }
 
@@ -472,13 +580,93 @@ export default function App() {
               ))}
             </ul>
           )}
-          <label className="check">
-            <input type="checkbox" checked={exportDivergence} onChange={(e) => setExportDivergence(e.target.checked)} />
-            Export divergence diagnostic field (1/s)
-          </label>
-          <button className="primary" disabled={errors.length > 0 || running} onClick={generate}>
-            {running ? "Generating…" : "Generate grid"}
+          <div className="field-requests">
+            <div className="muted small">Export fields (opt-in)</div>
+            {FIELD_OPTIONS.map(([id, label]) => (
+              <label key={id} className="check">
+                <input type="checkbox" checked={requestedFields.includes(id)} onChange={(e) => toggleField(id, e.target.checked)} />
+                {label}
+              </label>
+            ))}
+            {projectionRequested && (
+              <div className="projection-settings">
+                <div className="vec3-inputs">
+                  <NumberField
+                    label="U_in (m/s)"
+                    value={projectionSettings.inlet_velocity}
+                    min={0}
+                    onChange={(inlet_velocity) => setProjectionSettings((p) => ({ ...p, inlet_velocity }))}
+                  />
+                  <NumberField
+                    label="ρ (kg/m³)"
+                    value={projectionSettings.density}
+                    min={1e-9}
+                    onChange={(density) => setProjectionSettings((p) => ({ ...p, density }))}
+                  />
+                </div>
+                <div className="vec3-inputs">
+                  <NumberField
+                    label="tolerance"
+                    value={projectionSettings.tolerance}
+                    min={1e-15}
+                    max={0.5}
+                    onChange={(tolerance) => setProjectionSettings((p) => ({ ...p, tolerance }))}
+                  />
+                  <NumberField
+                    label="max iterations"
+                    value={projectionSettings.max_iterations}
+                    integer
+                    min={1}
+                    max={1000000}
+                    onChange={(max_iterations) => setProjectionSettings((p) => ({ ...p, max_iterations }))}
+                  />
+                </div>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={projectionSettings.dt === null}
+                    onChange={(e) => setProjectionSettings((p) => ({ ...p, dt: e.target.checked ? null : 1e-3 }))}
+                  />
+                  Δt from CFL 0.5 (pressure scale p = ρφ/Δt)
+                </label>
+                {projectionSettings.dt !== null && (
+                  <NumberField
+                    label="Δt (s)"
+                    value={projectionSettings.dt}
+                    min={1e-12}
+                    onChange={(dt) => setProjectionSettings((p) => ({ ...p, dt }))}
+                  />
+                )}
+                <PressureSolverField
+                  value={projectionSettings.pressure_solver}
+                  onChange={(pressure_solver) => setProjectionSettings((p) => ({ ...p, pressure_solver }))}
+                />
+              </div>
+            )}
+            <div className="muted small">Time-dependent Navier–Stokes (runs in the background)</div>
+            {SIMULATION_FIELD_OPTIONS.map(([id, label]) => (
+              <label key={id} className="check">
+                <input type="checkbox" checked={requestedFields.includes(id)} onChange={(e) => toggleField(id, e.target.checked)} />
+                {label}
+              </label>
+            ))}
+            {simulationRequested && (
+              <SimulationSettingsView
+                settings={simulationSettings}
+                onChange={setSimulationSettings}
+                estimate={estimate.value}
+                estimateError={estimate.error}
+              />
+            )}
+          </div>
+          <button
+            className="primary"
+            disabled={errors.length > 0 || running || (simulationRequested && estimate.value?.ok === false)}
+            onClick={generate}
+          >
+            {running ? (activeJob ? "Simulating…" : "Generating…") : simulationRequested ? "Generate & simulate" : "Generate grid"}
           </button>
+          {activeJob && <SimulationProgressView job={activeJob} onCancel={cancelActiveJob} />}
           {jobError && <p className="error">{jobError}</p>}
           {result && (
             <div className="stats">
@@ -515,11 +703,26 @@ export default function App() {
           )}
         </Panel>
 
+        {lastJob &&
+          (lastJob.status === "failed" ||
+            lastJob.status === "cancelled" ||
+            lastJob.status === "stopped" ||
+            (result !== null && result.fields.length === 0)) && (
+            <FieldsNotice
+              outcome={lastJob}
+              showingPreviousFields={(lastJob.status === "failed" || lastJob.status === "cancelled") && (result?.fields.length ?? 0) > 0}
+            />
+          )}
         {result && result.fields.length > 0 && (
           <FieldsPanel
             fields={result.fields}
             selected={selectedField}
-            onSelect={setSelectedField}
+            onSelect={(name) => {
+              setSelectedField(name);
+              setSelectedFrame(0);
+            }}
+            frame={selectedFrame}
+            onFrameChange={setSelectedFrame}
             data={fieldData}
             loading={fieldStatus.loading}
             error={fieldStatus.error}
@@ -528,6 +731,8 @@ export default function App() {
             colormap={fieldColormap}
             range={fieldRange}
             planeCoordinate={fieldPlane}
+            projection={result.meta.projection ?? null}
+            simulation={result.meta.simulation ?? null}
           />
         )}
 

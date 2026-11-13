@@ -86,9 +86,15 @@ export function cssGradient(kind: ColormapKind, steps = 16): string {
   return `linear-gradient(to right, ${parts.join(", ")})`;
 }
 
-/** Legend tick values: ends of the range, plus zero when it lies strictly inside. */
+/**
+ * Legend tick values: ends of the range, plus zero when it lies strictly inside. A degenerate
+ * range (e.g. an exactly zero field, auto range [-0, 0]) yields a single tick; -0 is shown as 0.
+ */
 export function legendTicks(range: ColorRange): number[] {
-  const ticks = [range.min, range.max];
-  if (range.min < 0 && range.max > 0) ticks.splice(1, 0, 0);
+  const lo = range.min === 0 ? 0 : range.min;
+  const hi = range.max === 0 ? 0 : range.max;
+  if (!(hi > lo)) return [lo];
+  const ticks = [lo, hi];
+  if (lo < 0 && hi > 0) ticks.splice(1, 0, 0);
   return ticks;
 }

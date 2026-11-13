@@ -1,6 +1,13 @@
 // Geometry source for the solid-cell mask (Milestone 2B). The procedural box and the imported
 // mesh are mutually exclusive; a request never carries both.
-import type { FieldId, GridJobRequest } from "./api";
+import {
+  PROJECTION_FIELD_IDS,
+  SIMULATION_FIELD_IDS,
+  type FieldId,
+  type GridJobRequest,
+  type ProjectionRequest,
+  type SimulationRequest,
+} from "./api";
 import { boundsSize, serializeTransform, type Bounds, type LengthUnit } from "./transform";
 import type { Domain, ModelTransform, Resolution, TestBox, Vec3 } from "./types";
 
@@ -25,13 +32,29 @@ export function buildGridJobRequest(
   testBox: TestBox | null,
   mesh: MeshInput | null,
   fields: FieldId[] = [],
+  projectionSettings: ProjectionRequest | null = null,
+  simulationSettings: SimulationRequest | null = null,
 ): GridJobRequest {
+  const simulation = fields.some((f) => SIMULATION_FIELD_IDS.includes(f)) ? simulationSettings : null;
+  // Projection settings only travel with projection fields (the diagnostic uses U_in too).
+  const needsSettings = fields.some((f) => PROJECTION_FIELD_IDS.includes(f) || f === "divergence_diagnostic");
+  const projection = needsSettings ? projectionSettings : null;
   const placement = mesh
     ? { model_id: mesh.modelId, model_transform: serializeTransform(mesh.units, mesh.pivot, mesh.transform) }
     : { model_id: null, model_transform: null };
   if (source === "mesh") {
     if (!mesh) throw new Error("imported mesh mode needs an uploaded model");
-    return { domain, resolution, geometry_source: "mesh", test_box: null, ...placement, include_cells: true, fields };
+    return {
+      domain,
+      resolution,
+      geometry_source: "mesh",
+      test_box: null,
+      ...placement,
+      include_cells: true,
+      fields,
+      projection,
+      simulation,
+    };
   }
   return {
     domain,
@@ -41,6 +64,8 @@ export function buildGridJobRequest(
     ...placement,
     include_cells: true,
     fields,
+    projection,
+    simulation,
   };
 }
 

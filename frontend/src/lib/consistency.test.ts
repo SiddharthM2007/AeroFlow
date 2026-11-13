@@ -2,6 +2,7 @@
 // backend/tests/test_mesh.py. Both sides must produce the same world-space bounds.
 import { describe, expect, it } from "vitest";
 import boxObj from "../../../fixtures/geometry/box_quads.obj?raw";
+import { DEFAULT_PROJECTION, DEFAULT_SIMULATION } from "./fieldPrefs";
 import { buildGridJobRequest, checkModelResolution } from "./geometrySource";
 import { CELL_SOLID, cellCentersOfType, makeGridGeometry } from "./grid";
 import { loadModelFile } from "./loaders";
@@ -82,6 +83,16 @@ describe("geometry source requests", () => {
 
   it("mesh mode requires an uploaded model", () => {
     expect(() => buildGridJobRequest("mesh", domain, res, null, null)).toThrow(/uploaded model/);
+  });
+
+  it("sends simulation settings only when a sim_* field is requested", () => {
+    const sim = { ...DEFAULT_SIMULATION, duration: 0.2 };
+    const withSim = buildGridJobRequest("procedural_box", domain, res, box, null, ["sim_pressure"], null, sim);
+    expect(withSim.simulation).toEqual(sim);
+    expect(withSim.simulation?.pressure_solver).toBe("auto");  // sent with the job
+    expect(withSim.projection).toBeNull();
+    const without = buildGridJobRequest("procedural_box", domain, res, box, null, ["pressure"], DEFAULT_PROJECTION, sim);
+    expect(without.simulation).toBeNull();
   });
 });
 

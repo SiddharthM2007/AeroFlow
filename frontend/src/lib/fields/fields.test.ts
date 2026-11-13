@@ -190,6 +190,11 @@ describe("color mapping", () => {
   it("builds legend ticks and gradients", () => {
     expect(legendTicks({ min: -3, max: 3 })).toEqual([-3, 0, 3]);
     expect(legendTicks({ min: 0, max: 3 })).toEqual([0, 3]);
+    // All-zero field: auto range is [-0, 0]; one tick, and never a negative zero.
+    const zero = legendTicks({ min: -0, max: 0 });
+    expect(zero).toHaveLength(1);
+    expect(Object.is(zero[0], -0)).toBe(false);
+    expect(legendTicks({ min: 2, max: 2 })).toEqual([2]);
     expect(cssGradient("sequential", 4)).toMatch(/^linear-gradient\(to right, rgb\(68, 1, 84\) 0.0%/);
   });
 });

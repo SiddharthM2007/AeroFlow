@@ -1,5 +1,6 @@
 import { cssGradient, legendTicks, type ColorRange, type ColormapKind } from "../lib/fields/colormap";
 import type { FieldMetadata } from "../lib/fields/format";
+import { provenanceLabel } from "../lib/fields/provenance";
 import { AXIS_NAMES, type Axis } from "../lib/fields/sampling";
 
 interface FieldLegendProps {
@@ -18,17 +19,21 @@ export function FieldLegend({ meta, range, colormap, axis, index, planeCoordinat
   const span = range.max - range.min;
   return (
     <div className="field-legend">
-      {meta.provenance.kind === "diagnostic" && <div className="legend-badge">Diagnostic — not a solved airflow</div>}
+      {provenanceLabel(meta) && <div className="legend-badge">{provenanceLabel(meta)!.badge}</div>}
       <div className="legend-title">
         {meta.long_name} <span className="muted">[{meta.units}]</span>
       </div>
       <div className="legend-bar" style={{ background: cssGradient(colormap) }} />
       <div className="legend-ticks">
-        {ticks.map((t) => (
-          <span key={t} style={{ left: `${span > 0 ? ((t - range.min) / span) * 100 : 50}%` }}>
-            {fmt(t)}
-          </span>
-        ))}
+        {ticks.length === 1 ? (
+          <span style={{ left: "50%", transform: "translateX(-50%)" }}>{fmt(ticks[0])}</span>
+        ) : (
+          ticks.map((t, n) => (
+            <span key={n} style={{ left: `${((t - range.min) / span) * 100}%` }}>
+              {fmt(t)}
+            </span>
+          ))
+        )}
       </div>
       <div className="legend-meta muted">
         {AXIS_NAMES[axis]}-slice {index} at {AXIS_NAMES[axis]} = {fmt(planeCoordinate)} m · frame {meta.frame.index}
