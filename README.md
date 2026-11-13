@@ -4,18 +4,34 @@ A browser-based 3D virtual wind tunnel. Users import STL/OBJ models, configure
 the tunnel and computational grid, and (in later milestones) run a custom C++
 incompressible Navier–Stokes solver.
 
-**Current status: Milestone 4A, scientific field visualization.** It builds on
+**Current status: Milestone 7, pressure solver acceleration.** It builds on
 Milestone 1 (the grid foundation), 2A (geometry-aware tunnel fitting), 2B (CAD
-mesh voxelization) and 3A (staggered MAC grid and discrete divergence).
+mesh voxelization), 3A (staggered MAC grid and discrete divergence), 3B
+(boundary conditions), 4A (field visualization), 5 (pressure projection) and 6
+(time-dependent Navier–Stokes).
+
+- **Pressure solver (7):** a multigrid-preconditioned conjugate gradient solver
+  (MG-PCG) solves the same pressure equation to the same tolerance as the
+  original Jacobi-PCG, about 7–19× faster per solve on 65 k–2 M cell grids.
+  `auto` (the default) selects it from 1,000 fluid cells; Jacobi-PCG remains
+  selectable and is the automatic fallback.
+
+- **Navier–Stokes (6):** a first-order fractional-step solver advances the flow
+  in time. Runs execute as background jobs with progress, cancellation and a
+  preflight cost check, and write one field file per frame. The viewer has a
+  frame slider with the physical time.
 
 - **Field pipeline:** numerical fields now travel from C++ through FastAPI to the
   browser in a versioned binary format (AFFIELD).
 - **Viewer:** fields are shown as colored 3D slices with a legend.
 - **Boundary conditions (3B):** the C++ MAC grid has reusable boundary-condition
   operators for the future solver.
+- **Pressure projection (5):** a matrix-free pressure Poisson solve projects an
+  initialized velocity field to an approximately divergence-free one. Pressure,
+  divergence and velocity magnitude can be viewed in the browser.
 - **First field:** a *divergence diagnostic* of an initialized velocity field.
-  There is no advection, diffusion, pressure solve or time stepping yet, so
-  nothing shown is a solved airflow.
+  It, and the single projection of Milestone 5, are labelled in the viewer so
+  they are not mistaken for the time-dependent solution.
 
 ```
 AeroFlow/
@@ -339,6 +355,379 @@ areas, and total leakage through walls and obstacles, which must be 0 after
 - **Floor:** ground-plane (no-slip floor) runs are not supported. All four lateral
   walls are free-slip, matching the free-stream tunnel fitting from 2A.
 
+## Pressure Poisson solver and velocity projection (approved for Milestone 5)
+
+The code is in `engine/include/aeroflow/pressure.hpp` and `src/pressure.cpp`.
+
+**Unknowns and formulation.** The solve works in the projection potential
+`φ = (Δt/ρ)·p`, with one unknown per fluid cell numbered x-fastest. Solid cells
+are not unknowns. The reported pressure is `p = (ρ/Δt)·φ` in Pa, a gauge
+pressure with p = 0 on the outlet plane.
+
+**Gradient G**, with h the spacing along the face normal:
+
+| Face (3B role) | `(Gφ)_f` | Velocity corrected? |
+|---|---|---|
+| `Interior` (Coupled) | `(φ_R − φ_L)/h` | yes |
+| `Outlet` (Dirichlet) | ghost `φ_g = −φ_L`, giving `(φ_g − φ_L)/dx = −φ_L/(dx/2)`: p = 0 **on the outlet plane**, half a cell from the last center | yes |
+| `Inlet`, `SlipWall`, `SolidWall`, `Inactive` (Neumann) | 0 | **never** |
+
+**Projection and pressure system.** The projection is `u_new = u* − Gφ` on
+Coupled and Outlet faces only. With the existing MAC divergence D,
+`L = D∘G` is symmetric negative semidefinite, so the solver works with the SPD
+operator **`A = −L`**:
+
+```
+(Aφ)_c = Σ_coupled (φ_c − φ_nb)/h²  +  Σ_outlet 2φ_c/dx²        A φ = b,   b = −D u*
+```
+
+- **Remaining divergence:** `D u_new = −(b − Aφ)`. The divergence left after
+  projection is exactly the negated solver residual. It is recomputed
+  independently with `compute_divergence` and never set to zero.
+- **Operator:** matrix-free, with no stored matrix. Per fluid cell it keeps the
+  cell index, a 6-bit coupled-face mask, the diagonal and its inverse, and the
+  component id.
+
+**Solver.** Jacobi-preconditioned conjugate gradient in double precision.
+
+- **Stopping rule:** `‖b − Aφ‖₂ ≤ tol·‖b‖₂` (default `tol = 1e-10`,
+  `max_iterations = 10000`), checked with the **true** residual. The solver
+  restarts if the recursively updated residual has drifted.
+- **Memory:** work vectors are allocated once, with no allocation inside the
+  iteration loop.
+- **Zero right-hand side:** a right-hand side of exactly 0 (uniform flow in an
+  empty tunnel) finishes in 0 iterations, and the velocity is unchanged bit for
+  bit.
+- **Failures:** CG breakdown gives `solver_breakdown`, and not reaching the
+  tolerance gives `projection_not_converged`. **Either one fails the job.**
+
+**Disconnected fluid regions.** Components are found by flood fill through
+coupled faces.
+
+| Component | Handling |
+|---|---|
+| Touches the outlet | SPD, solved directly |
+| No outlet, net source ≈ 0 (e.g. a cavity enclosed by a mesh) | Singular; solved with a **zero-mean pressure gauge** |
+| No outlet but a net source (e.g. a pocket fed by the inlet) | **`incompatible_component` error** that names the region; inflow cannot leave |
+
+**Settings** (engine `"projection"` block, or `projection` in a grid-job request):
+
+| Setting | Default | Notes |
+|---|---|---|
+| `inlet_velocity` | 5 m/s | also used by the 4A diagnostic |
+| `density` | 1.225 kg/m³ | |
+| `dt` | `0.5·min(dx,dy,dz)/U_in` (CFL 0.5) | required when `U_in = 0` |
+| `tolerance` | 1e-10 | relative residual, in (0, 1) |
+| `max_iterations` | 10000 | 1 to 1,000,000 |
+
+Invalid values are rejected with field-level `422` errors (backend) or exit code
+2 (engine).
+
+**Fields.** These are opt-in AFFIELD ids, all produced by one projection of the
+initialized field (uniform `U_in` on active faces, then the 3B boundary
+conditions). Their provenance is `kind: "projection", solved: false`.
+
+| Field | Units | Map |
+|---|---|---|
+| `pressure` | Pa | diverging |
+| `divergence_before` | 1/s | diverging |
+| `divergence_after` | 1/s | diverging |
+| `velocity_magnitude` | m/s | sequential; `√(ū²+v̄²+w̄²)` from face-pair averages |
+
+The job result also gains a `projection` block: iterations, relative residual,
+divergence before and after, inlet and outlet flux, wall leakage, Δt, memory and
+timings. The UI shows it in the Fields panel.
+
+**Validation** (`engine/tests/test_pressure.cpp`, `backend/tests/test_projection.py`):
+
+- **Operator consistency:** `Aφ = D(−Gφ)` to 1e-12 on an anisotropic obstacle
+  grid; A is symmetric and positive definite.
+- **Half-cell outlet:** a 1D problem with p = 0 on the plane has the discrete
+  solution `a(x² − Lx²)/2 − a dx²/8` exactly, and the error ratio under
+  refinement is 4.000 (second order). Pinning φ at the last cell center would be
+  first order.
+- **Projection results:**
+  - Uniform empty tunnel: unchanged.
+  - Random divergent field: RMS div 28.1 → 2.3e-9.
+  - Voxelized sphere: max |div| 50 → 1.8e-9 with zero leakage, `Q_out = Q_in`,
+    and prescribed faces bit-identical before and after.
+- **Error cases:** non-convergence, incompatible regions, enclosed cavities and
+  single-cell pockets.
+
+**Performance** (Apple Silicon, single thread, full engine run including field
+export; procedural box obstacle, tol 1e-10):
+
+| Grid | Cells | PCG iterations | Solve | Peak RSS |
+|---|---|---|---|---|
+| 64×32×32 | 65,536 | 279 | 0.11 s | 13 MB |
+| 128×64×64 | 524,288 | 561 | 1.8 s | 91 MB |
+| 128³ (cap) | 2,097,152 | 790 | 10.8 s | 391 MB |
+| 256×96×85 (anisotropic) | 2,088,960 | 1,216 | 15.8 s | 406 MB |
+
+Jacobi PCG needs roughly O(N^(1/3)) iterations, so a full-size grid takes 10–16 s.
+That is inside the 60 s engine timeout but slow. Multigrid or a parallel operator
+are the natural next optimizations.
+
+**Limitations.**
+
+- **Single projection:** this is one projection of a prescribed initial field.
+  There is no advection, diffusion or time stepping, so the flow is a
+  potential-flow-like, inviscid correction, not a Navier–Stokes solution.
+- **Pressure magnitude:** it scales as ρ/Δt (an impulse pressure), not a
+  steady aerodynamic pressure.
+- **Obstacle shape:** no-slip enters only through no penetration at voxel faces;
+  stair-step geometry remains.
+
+## Time-dependent Navier–Stokes (approved for Milestone 6)
+
+The engine solves the incompressible equations
+
+    ∂u/∂t + (u·∇)u = −∇p/ρ + ν∇²u,   ∇·u = 0
+
+on the MAC grid with constant ρ and ν, using the 3B boundary conditions and the
+Milestone 5 projection.
+
+**One step** (`Simulation::advance`, `engine/src/simulation.cpp`):
+
+1. Apply the velocity boundary conditions (prescribed inlet, slip walls,
+   zero-gradient outlet, no-penetration solid faces).
+2. Predictor, forward Euler, on `Interior` faces only:
+   `u* = uⁿ + Δt [−(uⁿ·∇)uⁿ + ν∇²uⁿ]`. All other faces are copied unchanged.
+3. Projection: solve `A φ = −D u*` with Jacobi PCG, then `uⁿ⁺¹ = u* − Gφ`
+   and `p = ρφ/Δt`.
+   - **Warm start:** the solve starts from the previous step's pressure,
+     `φ_guess = (Δt/Δt_prev) φ_prev = Δt p_prev/ρ`. It stays consistent when a
+     step is shortened to land on a frame.
+   - **First step:** starts cold. The initial projection's potential is an
+     impulse, not a pressure.
+   - **Accuracy:** the stopping test is relative to ‖b‖, so the warm start
+     changes only the iteration count.
+4. Check for non-finite values and record step statistics.
+
+**Spatial operators** (`engine/src/momentum.cpp`):
+
+- **Advection:** advective form with first-order upwinding. Each derivative
+  takes the one-sided difference on the upstream side of the transporting
+  velocity. The transverse velocities at a face are 4-point averages.
+- **Diffusion:** the 7-point Laplacian on each face grid.
+- **Neighbours across boundaries:** they use the 3B ghost rules: even at slip
+  walls and the outlet, odd (no-slip) at inactive solid faces and the inlet,
+  and the stored value at solid-wall faces. Along a face's own axis past the
+  outlet, the value is copied (zero gradient).
+
+**Time step.** Forward Euler with upwinding is stable (positive coefficients)
+when
+
+    Δt · ( |u|max/dx + |v|max/dy + |w|max/dz + 2ν(1/dx² + 1/dy² + 1/dz²) ) ≤ 1
+
+The solver uses `Δt = CFL × that limit` (CFL ≤ 1, default 0.5). It recomputes
+the limit every step from the current velocities, and shortens steps so frames
+land exactly on their target times.
+
+- **User Δt:** a user Δt acts as an upper cap. If it exceeds the stability limit
+  of the projected initial field, the job fails with `unstable_timestep`. It is
+  never silently reduced.
+- **Step budget:** if the run would need more than `max_steps`, it is rejected
+  before starting (`step_budget`).
+
+**Pressure.** The scheme is non-incremental (Chorin): each step solves for the
+full pressure, with no pressure in the predictor.
+
+- `p` is a gauge pressure, with p = 0 on the outlet plane.
+- It is only first-order accurate in time, O(Δt). Expect a thin
+  boundary-layer error near walls.
+- Unlike the Milestone 5 impulse pressure, it has physical units and a physical
+  magnitude.
+
+**Initial field.**
+
+- `uniform`: U_in everywhere, projected once.
+- `rest`: zero velocity inside, with only the inlet prescribed.
+
+**Settings** (`simulation` block of a grid job):
+
+| Setting | Default | Notes |
+|---|---|---|
+| `inlet_velocity` | 5 m/s | |
+| `density` | 1.225 kg/m³ | |
+| `viscosity` | 1.5e-5 m²/s | ν ≥ 0 |
+| `duration` | 0.5 s | |
+| `frame_interval` | 0.05 s | ≤ 10,000 frames |
+| `cfl` | 0.5 | (0, 1] |
+| `dt` | adaptive | optional cap |
+| `max_steps` | 2000 | |
+| `initial` | `uniform` | |
+
+The pressure tolerance and iteration limit are shared with Milestone 5.
+
+**Output.**
+
+- **Fields:** `sim_pressure`, `sim_velocity_magnitude` and `sim_divergence` at
+  cell centres; `sim_u`, `sim_v` and `sim_w` on their faces.
+- **Files:** one AFFIELD file per field per frame (`<name>.f<frame>.affield`).
+  Each header carries the frame time, the step and
+  `provenance.kind = "simulation"`.
+- **Summary:** the job result contains a simulation summary with status, steps,
+  frame times, wall time, PCG iterations, memory and per-step history (Δt,
+  residual, divergence, inflow/outflow, wall leak, max speed, kinetic energy).
+
+**Budgets.** Three guards keep a run bounded:
+
+- **Preflight:** the backend estimates steps, runtime, output size and memory
+  (`backend/app/simulation_estimate.py`, calibrated on the benchmarks below).
+  It rejects a run before it starts (422) when any of these exceeds its budget.
+- **Wall-time stop:** the engine stops cleanly at the wall-time budget
+  (`AEROFLOW_SIM_TIMEOUT_S`). It keeps the frames already written, and the job
+  ends as `stopped` with error code `wall_time_budget`.
+- **Cancellation:** cancelling kills the run and discards its frames.
+
+**Validation** (`engine/tests/test_momentum.cpp`, `test_simulation.cpp`):
+
+- **Exactness:**
+  - The operators are exact for uniform flow and linear advected profiles.
+  - The Laplacian of a quadratic is exact on anisotropic spacing.
+  - Boundary neighbours are identical to the 3B `tangential_neighbor`.
+- **Upwind transport of a smooth profile:** observed order 0.82 → 0.88 → 0.94
+  under refinement (first order).
+- **Viscous decay of a sine mode:** matches the discrete prediction to round-off,
+  and the continuous decay `exp(−νk²t)` to 8e-5.
+- **Uniform flow and fluid at rest:** both are preserved bit-exactly.
+- **Box obstacle:** `wall_leak = 0` and `Q_out = Q_in` to 1e-6 every step;
+  max |div| after projection is at the solver tolerance.
+- **Δt refinement:** the error ratio is 2.05 (first order in time).
+- **Enclosed cavity without inflow:** kinetic energy never increases.
+- **Rejections:** invalid settings, unstable Δt and step budgets are rejected.
+  Frames land exactly on their times, and the wall-time budget stops a run
+  cleanly.
+
+**Performance** (Apple Silicon, single thread, box obstacle, 0.1 s simulated,
+3 frames × 3 fields):
+
+| Grid | Cells | Steps | Time/step | PCG it/step (mean / max) | Peak memory | Output |
+|---|---|---|---|---|---|---|
+| 64×32×32 | 65,536 | 66 | 97 ms | 212 / 285 | 19 MB | 2.8 MB |
+| 128×64×64 | 524,288 | 152 | 1.56 s | 414 / 531 | 141 MB | 22.5 MB |
+
+The pressure solve dominates, and warm starts cut iterations only modestly. The
+default 0.5 s run takes about 30 s at 64×32×32 and about 20 min at 128×64×64.
+At the 2.1 M-cell cap it would take hours, so the preflight rejects it under the
+default 15-minute budget. Multigrid is the natural next optimization.
+
+**Limitations.**
+
+- **Numerical viscosity:** first-order upwinding adds roughly `|u|h/2`. At
+  practical grid sizes this far exceeds air's ν, so the effective Reynolds
+  number is grid-dependent and much lower than the physical one. Wakes are
+  overly diffused.
+- **Time accuracy:** first order in time (forward Euler, non-incremental
+  pressure). The pressure has an O(Δt) error.
+- **Outlet:** the zero-gradient outlet does not prevent backflow. A wake that
+  reaches the outlet can re-enter.
+- **Geometry and resolution:** no turbulence model; stair-step voxel geometry;
+  uniform grid.
+
+## Pressure solver acceleration (approved for Milestone 7)
+
+Both solvers are preconditioned conjugate gradients on the unchanged Milestone 5
+operator `A = −D∘G`.
+
+- **Shared:** the same right-hand side, the same boundary conditions (Neumann on
+  prescribed faces, p = 0 on the outlet plane), the same compatibility check and
+  zero-mean gauge for enclosed regions, and the same stopping test.
+- **Stopping test:** the true relative residual ‖b − Aφ‖ ≤ tol·‖b‖. Failure is
+  still `projection_not_converged`.
+- **Only the preconditioner differs.**
+
+| Setting | Behaviour |
+|---|---|
+| `jacobi_pcg` | z = D⁻¹r (the validated Milestone 5 baseline) |
+| `mgpcg` | z = Π·B·Π r: one symmetric multigrid V-cycle B, where Π removes the mean of every enclosed (no-outlet) region, i.e. A's nullspace |
+| `auto` (default) | `mgpcg` from 1,000 fluid cells, else `jacobi_pcg` |
+
+`pressure_solver` is accepted in the `projection` and `simulation` blocks of a
+grid job (API and engine config) and in the viewer's Pressure solver menu. The
+choice changes speed only, not the physics.
+
+**Multigrid V-cycle** (`engine/src/multigrid.cpp`):
+
+- **Finest level:** the PressureSystem operator itself. A test checks bit-identical
+  results.
+- **Coarse grids:**
+  - Cell-centred 2:1 coarsening; an odd count n becomes ⌈n/2⌉ with a half-width
+    last cell.
+  - Semi-coarsening: an axis is coarsened only while its width is ≤ 1.5 × the
+    smallest width.
+  - A coarse cell is fluid if any child is.
+- **Coarse operators:** rediscretized in conductance form, with each coarse
+  face's coefficient = (summed open area of the finer faces) / (true
+  centre-to-centre distance), and outlet faces using half the cell width.
+  - They are symmetric and positive semidefinite by construction, with partial
+    cells exact.
+  - Obstacles appear as partially open faces.
+  - Regions separated by walls thinner than a coarse cell may merge on coarse
+    levels. That only affects the preconditioner's quality.
+- **Transfers:** piecewise-constant (default) or trilinear; restriction is the
+  exact transpose (R = Pᵀ).
+- **Cycle:** V(2,2) red-black Gauss-Seidel, pre-sweeps red→black and post-sweeps
+  black→red (the adjoint ordering), with a fixed 16 + 16 symmetric sweeps on the
+  coarsest level (≤ 512 unknowns).
+- **Properties:** B is a fixed linear map, symmetric and positive definite in the
+  PCG inner product. Tests check this, including dense Cholesky factorizations.
+- **Reuse:** the hierarchy is built once per grid and obstacle configuration and
+  reused, with its work buffers, by every time step.
+
+**Fallback.** If the hierarchy cannot be built, or rᵀz ≤ 0, non-finite, or
+dᵀAd ≤ 0 on the multigrid path, the solve continues with Jacobi-PCG from the
+current iterate. The switch is reported in the job summary and logged as a
+warning; it is never silent.
+
+**Warm starts** carry the pressure, not the potential, across steps:
+φ_guess = (Δt/Δt_prev)·φ_prev. The first physical step starts cold, because the
+initial projection's potential is an impulse.
+
+**Optional max-divergence test** (engine setting `max_divergence`, off by
+default): it also requires max |b − Aφ| ≤ the given value (1/s).
+
+- **Why MG-PCG's maximum is higher:** it leaves its (smaller) residual
+  concentrated next to obstacle surfaces, where Jacobi-PCG spreads it.
+  - RMS: 5–10× lower with MG-PCG.
+  - Max/RMS: up to 223 with MG-PCG vs 5–8 with Jacobi-PCG.
+- **Cost of the test:** about 3% (box) to 11% (STL) of solve time.
+- **Why it is off:** the 2-norm test is the established criterion, and the
+  difference (≤ 5e-7 1/s) is physically negligible.
+
+**Benchmarks** (Apple M2 Pro, single thread, tolerance 1e-8, the same steps with
+both solvers, including the initial projection and setup):
+
+| Case | Steps | Total time | Pressure time per step | Iterations per step | MG setup / memory |
+|---|---|---|---|---|---|
+| 64×32×32 box | 20 | 2.58 → 0.46 s | 114 → 14 ms | 271 → 6.6 | 2 ms / 1.5 MB |
+| 64×32×32 Valve Body STL | 20 | 2.68 → 0.53 s | 119 → 18 ms | 282 → 8.1 | 2 ms / 1.6 MB |
+| 128×64×64 box | 8 | 19.4 → 1.76 s | 2047 → 131 ms | 545 → 7.0 | 14 ms / 12 MB |
+| 128×64×64 Valve Body STL | 8 | 20.5 → 2.36 s | 2208 → 199 ms | 595 → 10.9 | 15 ms / 12 MB |
+| 200×102×102 box | 4 | 66.9 → 4.65 s | 12.5 → 0.66 s | 851 → 8.0 | 64 ms / 49 MB |
+| 200×102×102 Valve Body STL | 4 | 65.5 → 5.82 s | 12.0 → 0.87 s | 838 → 12.0 | 62 ms / 49 MB |
+| 256×96×85 anisotropic box | 3 | 58.4 → 4.33 s | 13.9 → 0.75 s | 873 → 8.3 | 106 ms / 71 MB |
+
+- **Agreement:** final velocities agree with Jacobi-PCG to ≤ 4e-10 and pressures
+  to ≤ 2e-8 (relative).
+- **Conservation:** wall leakage is 0, |Q_out/Q_in − 1| ≤ 2e-10, and no run fell
+  back.
+- **Defaults chosen by measurement:** V(1,1) and trilinear transfers were both
+  slower overall.
+- **Benchmark tool:** `pressure_bench --simulate compare` reproduces these
+  numbers.
+
+**Preflight estimates** (`backend/app/simulation_estimate.py`) use a separate
+calibrated model per solver, and `auto` is estimated with the solver it will
+select:
+
+- **Jacobi-PCG:** 7·N^(1/3) iterations × 7.5 ns per cell-iteration.
+- **MG-PCG:** 12 iterations × 36 ns per cell-iteration, plus setup.
+- **Other step work:** 120 ns per cell.
+
+A run rejected over the time budget is told whether the other solver would fit.
+
 ## Numerical fields and visualization (approved for Milestone 4A)
 
 ### AFFIELD v1: canonical binary field file
@@ -562,10 +951,17 @@ Library layout:
 | POST | `/api/models` | Multipart upload (`file`) of `.stl`/`.obj`; validates structure and returns `model_id` and counts |
 | GET | `/api/models/{model_id}` | Uploaded model metadata |
 | POST | `/api/grid-jobs` | Validates the grid config, runs the engine, and returns the job with the result. `geometry_source`: `procedural_box` (default, uses `test_box`) or `mesh` (requires `model_id` and `model_transform`; `test_box` must be null) |
-| GET | `/api/grid-jobs/{job_id}` | Fetch a previous job (kept in memory) |
+| GET | `/api/grid-jobs/{job_id}` | Fetch a job (kept in memory); poll this for simulation progress |
+| POST | `/api/grid-jobs/estimate` | Preflight estimate for a simulation request (steps, Δt, runtime, output, memory, problems); nothing is run |
+| POST | `/api/grid-jobs/{job_id}/cancel` | Cancel a queued or running simulation (409 if already final) |
+| GET | `/api/grid-jobs/{job_id}/fields/{name}?frame=N` | AFFIELD file for one field and frame |
 
-Grid jobs run synchronously, because the engine finishes in milliseconds at
-these sizes. They are stored in memory, and only the last 50 are kept. If the
+Grid jobs without simulation fields run synchronously, because the engine
+finishes in milliseconds to seconds. Jobs that request `sim_*` fields return
+`201` immediately with `status: "queued"` and an `estimate`. They run one at a
+time in the background, through `running` with live `progress`, and end as
+`completed`, `stopped` (wall-time budget; frames kept), `failed` or `cancelled`
+(frames removed). Jobs that have not finished are never evicted. They are stored in memory, and only the last 50 are kept. If the
 engine runs but fails, the request still returns `201` with
 `status: "failed"` and an `error`.
 
@@ -584,6 +980,8 @@ Environment variables:
 | `AEROFLOW_MAX_UPLOAD_MB` | `100` | Upload size limit |
 | `AEROFLOW_MAX_TRIANGLES` | `1000000` | Triangle limit for mesh voxelization |
 | `AEROFLOW_ENGINE_TIMEOUT_S` | `60` | Engine subprocess timeout |
+| `AEROFLOW_SIM_TIMEOUT_S` | `900` | Wall-time budget per simulation (preflight + engine hard stop) |
+| `AEROFLOW_SIM_MAX_MEMORY_MB` | `4096` | Preflight memory limit per simulation |
 
 Interactive docs are served at http://127.0.0.1:8000/docs.
 
@@ -591,10 +989,23 @@ Interactive docs are served at http://127.0.0.1:8000/docs.
 
 ```bash
 make test                     # everything
-ctest --test-dir engine/build --output-on-failure        # C++: grid, mesh, ray/BVH, voxelization, MAC grid, divergence, BCs, AFFIELD
+ctest --test-dir engine/build --output-on-failure        # C++: grid, mesh, ray/BVH, voxelization, MAC grid, divergence, BCs, AFFIELD, pressure, momentum, simulation
 cd backend && .venv/bin/python -m pytest -q              # API validation, uploads, mesh parsing, engine round-trips
 cd frontend && npm test && npm run build                 # TS unit tests + typecheck + production build
 ```
+
+Pressure-solver benchmark (optional, not part of `make test`):
+
+```bash
+cmake -S engine -B engine/build -DAEROFLOW_BUILD_BENCH=ON && cmake --build engine/build
+engine/build/pressure_bench --grid 128 64 64 --geometry box --steps 12   # also: empty | rest | mesh --mesh FILE.aftri
+engine/build/pressure_bench --grid 128 64 64 --geometry box --steps 8 --simulate compare   # Jacobi-PCG vs MG-PCG
+engine/build/pressure_bench --grid 128 64 64 --geometry box --multigrid                    # hierarchy, V-cycle profile
+```
+
+Each step solves the same system three ways (cold, legacy unscaled warm start,
+Δt-rescaled warm start) and reports iterations, time, divergence, flux balance
+and peak memory.
 
 The backend tests that run the engine are skipped if `engine/build/aeroflow-grid`
 has not been built.
@@ -606,11 +1017,11 @@ developer:
 
 - Volume fractions or cut cells for partially filled cells. The binary mask stays
   as it is, and a fraction field would be added alongside it.
-- The Navier–Stokes solver: discretization, variable arrangement, time
-  integration, pressure solve
-- Boundary conditions: inlet, outlet, walls, and solid surfaces
+- Higher-order advection (e.g. a TVD or QUICK scheme), second-order time
+  integration and an incremental pressure scheme
+- Multithreading (the multigrid smoother is red-black ordered and parallelizes
+  naturally)
+- A convective outlet or backflow treatment, and turbulence modelling
 - Non-uniform or refined grids
-- Advection, diffusion, pressure projection and time stepping (which will consume
-  the 3B boundary operators)
-- Pressure, velocity, vorticity, vector-arrow, streamline and multi-frame renderers
-  (the field format and pipeline already support them)
+- Vorticity, vector-arrow and streamline renderers, and frame animation
+  (playback)
