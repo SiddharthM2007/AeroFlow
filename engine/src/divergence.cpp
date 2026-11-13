@@ -7,6 +7,12 @@
 namespace aeroflow {
 
 DivergenceField compute_divergence(const MacGrid& mac, const Grid3D& mask) {
+  DivergenceField out;
+  compute_divergence_into(mac, mask, out);
+  return out;
+}
+
+void compute_divergence_into(const MacGrid& mac, const Grid3D& mask, DivergenceField& out) {
   if (!mac.matches(mask)) throw std::invalid_argument("solid mask does not match the MAC grid");
 
   const std::size_t nx = mac.nx(), ny = mac.ny(), nz = mac.nz();
@@ -16,7 +22,12 @@ DivergenceField compute_divergence(const MacGrid& mac, const Grid3D& mask) {
   const auto& w = mac.w();
   const auto cells = mask.cells();
 
-  DivergenceField out{StaggeredArray(nx, ny, nz, 0.0), 0};
+  if (out.values.n0() != nx || out.values.n1() != ny || out.values.n2() != nz) {
+    out.values = StaggeredArray(nx, ny, nz, 0.0);
+  } else {
+    out.values.fill(0.0);
+  }
+  out.fluid_cells = 0;
   for (std::size_t k = 0; k < nz; ++k) {
     for (std::size_t j = 0; j < ny; ++j) {
       for (std::size_t i = 0; i < nx; ++i) {
@@ -27,7 +38,6 @@ DivergenceField compute_divergence(const MacGrid& mac, const Grid3D& mask) {
       }
     }
   }
-  return out;
 }
 
 std::size_t count_fluid_cells(const Grid3D& mask) noexcept { return mask.count(CellType::Fluid); }

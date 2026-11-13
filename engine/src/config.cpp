@@ -143,11 +143,98 @@ FieldsRequest parse_fields(const json& obj) {
   return fields;
 }
 
+double optional_number(const json& obj, const char* key, const std::string& path, double fallback,
+                       bool (*ok)(double), const char* requirement) {
+  const auto it = obj.find(key);
+  if (it == obj.end()) return fallback;
+  const std::string field = path + "." + key;
+  if (!it->is_number()) fail(field, std::string("must be a number ") + requirement);
+  const double v = it->get<double>();
+  if (!std::isfinite(v) || !ok(v)) fail(field, std::string("must be ") + requirement);
+  return v;
+}
+
+PressureSolverKind parse_solver(const json& obj, const std::string& path) {
+  const auto it = obj.find("pressure_solver");
+  if (it == obj.end() || it->is_null()) return PressureSolverKind::Auto;
+  if (it->is_string()) {
+    if (const auto kind = parse_pressure_solver(it->get<std::string>())) return *kind;
+  }
+  fail(path + ".pressure_solver", "must be \"auto\", \"mgpcg\" or \"jacobi_pcg\"");
+}
+
+ProjectionConfig parse_projection(const json& obj) {
+  const std::string path = "projection";
+  if (!obj.is_object()) fail(path, "must be an object or null");
+  reject_unknown_keys(obj, {"inlet_velocity", "density", "dt", "tolerance", "max_iterations", "pressure_solver"}, path);
+  ProjectionConfig p;
+  p.pressure_solver = parse_solver(obj, path);
+  p.inlet_velocity = optional_number(obj, "inlet_velocity", path, p.inlet_velocity,
+                                     [](double v) { return v >= 0.0; }, "finite and >= 0 (m/s)");
+  p.density = optional_number(obj, "density", path, p.density, [](double v) { return v > 0.0; },
+                              "finite and > 0 (kg/m^3)");
+  if (const auto it = obj.find("dt"); it != obj.end() && !it->is_null()) {
+    p.dt = optional_number(obj, "dt", path, 0.0, [](double v) { return v > 0.0; }, "finite and > 0 (s)");
+  }
+  p.tolerance = optional_number(obj, "tolerance", path, p.tolerance,
+                                [](double v) { return v > 0.0 && v < 1.0; }, "in (0, 1)");
+  if (obj.contains("max_iterations")) {
+    p.max_iterations = require_count(obj, "max_iterations", path);
+    if (p.max_iterations > 1000000) fail(path + ".max_iterations", "must be <= 1000000");
+  }
+  return p;
+}
+
+SimulationConfig parse_simulation(const json& obj) {
+  const std::string path = "simulation";
+  if (!obj.is_object()) fail(path, "must be an object or null");
+  reject_unknown_keys(obj,
+                      {"inlet_velocity", "density", "viscosity", "duration", "frame_interval", "cfl", "dt",
+                       "max_steps", "tolerance", "max_iterations", "initial", "max_wall_seconds", "pressure_solver"},
+                      path);
+  SimulationConfig s;
+  s.inlet_velocity = optional_number(obj, "inlet_velocity", path, s.inlet_velocity,
+                                     [](double v) { return v >= 0.0; }, "finite and >= 0 (m/s)");
+  s.density = optional_number(obj, "density", path, s.density, [](double v) { return v > 0.0; },
+                              "finite and > 0 (kg/m^3)");
+  s.viscosity = optional_number(obj, "viscosity", path, s.viscosity, [](double v) { return v >= 0.0; },
+                                "finite and >= 0 (m^2/s)");
+  s.duration = optional_number(obj, "duration", path, s.duration, [](double v) { return v > 0.0; },
+                               "finite and > 0 (s)");
+  s.frame_interval = optional_number(obj, "frame_interval", path, s.frame_interval,
+                                     [](double v) { return v > 0.0; }, "finite and > 0 (s)");
+  s.cfl = optional_number(obj, "cfl", path, s.cfl, [](double v) { return v > 0.0 && v <= 1.0; }, "in (0, 1]");
+  if (const auto it = obj.find("dt"); it != obj.end() && !it->is_null()) {
+    s.dt = optional_number(obj, "dt", path, 0.0, [](double v) { return v > 0.0; }, "finite and > 0 (s)");
+  }
+  s.tolerance = optional_number(obj, "tolerance", path, s.tolerance,
+                                [](double v) { return v > 0.0 && v < 1.0; }, "in (0, 1)");
+  s.max_wall_seconds = optional_number(obj, "max_wall_seconds", path, s.max_wall_seconds,
+                                       [](double v) { return v > 0.0 && v <= 86400.0; }, "in (0, 86400] s");
+  if (obj.contains("max_steps")) {
+    s.max_steps = require_count(obj, "max_steps", path);
+    if (s.max_steps > 1000000) fail(path + ".max_steps", "must be <= 1000000");
+  }
+  if (obj.contains("max_iterations")) {
+    s.max_iterations = require_count(obj, "max_iterations", path);
+    if (s.max_iterations > 1000000) fail(path + ".max_iterations", "must be <= 1000000");
+  }
+  if (const auto it = obj.find("initial"); it != obj.end()) {
+    if (!it->is_string() || (*it != "uniform" && *it != "rest")) {
+      fail(path + ".initial", "must be \"uniform\" or \"rest\"");
+    }
+    s.initial = it->get<std::string>();
+  }
+  if (s.duration / s.frame_interval > 10000.0) fail(path, "duration / frame_interval must not exceed 10000 frames");
+  s.pressure_solver = parse_solver(obj, path);
+  return s;
+}
+
 }  // namespace
 
 GridConfig parse_config(const json& root) {
   if (!root.is_object()) throw ConfigError("config: top-level value must be a JSON object");
-  reject_unknown_keys(root, {"domain", "resolution", "test_box", "mesh", "fields"}, "");
+  reject_unknown_keys(root, {"domain", "resolution", "test_box", "mesh", "fields", "projection", "simulation"}, "");
 
   GridConfig config;
 
@@ -181,6 +268,12 @@ GridConfig parse_config(const json& root) {
   }
   if (const auto it = root.find("fields"); it != root.end() && !it->is_null()) {
     config.fields = parse_fields(*it);
+  }
+  if (const auto it = root.find("projection"); it != root.end() && !it->is_null()) {
+    config.projection = parse_projection(*it);
+  }
+  if (const auto it = root.find("simulation"); it != root.end() && !it->is_null()) {
+    config.simulation = parse_simulation(*it);
   }
   return config;
 }

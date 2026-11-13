@@ -104,6 +104,17 @@ void validate_boundaries(const BoundaryMap& map, const BoundaryConditions& bc) {
 }
 
 void apply_velocity_bcs(MacGrid& mac, const BoundaryMap& map, const BoundaryConditions& bc) {
+  apply_prescribed_velocity_bcs(mac, map, bc);
+
+  // Zero-gradient outlet predictor: copy the opposite face of the last cell (already final).
+  auto& u = mac.u();
+  const std::size_t nx = map.nx;
+  for (std::size_t k = 0; k < map.nz; ++k)
+    for (std::size_t j = 0; j < map.ny; ++j)
+      if (map.u[u.index(nx, j, k)] == VelocityFaceBC::Outlet) u(nx, j, k) = u(nx - 1, j, k);
+}
+
+void apply_prescribed_velocity_bcs(MacGrid& mac, const BoundaryMap& map, const BoundaryConditions& bc) {
   validate_boundaries(map, bc);
   if (!map.matches(mac)) throw BoundaryError("boundary map does not match the MAC grid");
 
@@ -123,13 +134,6 @@ void apply_velocity_bcs(MacGrid& mac, const BoundaryMap& map, const BoundaryCond
   prescribe(mac.u(), map.u, bc.inlet_velocity);
   prescribe(mac.v(), map.v, 0.0);
   prescribe(mac.w(), map.w, 0.0);
-
-  // Zero-gradient outlet predictor: copy the opposite face of the last cell (already final).
-  auto& u = mac.u();
-  const std::size_t nx = map.nx;
-  for (std::size_t k = 0; k < map.nz; ++k)
-    for (std::size_t j = 0; j < map.ny; ++j)
-      if (map.u[u.index(nx, j, k)] == VelocityFaceBC::Outlet) u(nx, j, k) = u(nx - 1, j, k);
 }
 
 double tangential_neighbor(const MacGrid& mac, const BoundaryMap& map, VelocityComponent component,

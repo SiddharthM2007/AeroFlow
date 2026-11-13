@@ -11,6 +11,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(AEROFLOW_BUILD_TESTS "Build the AeroFlow engine unit tests" ON)
+option(AEROFLOW_BUILD_BENCH "Build the pressure-solver benchmark (engine/bench)" OFF)
 
 include(FetchContent)
 
@@ -37,6 +38,10 @@ add_library(aeroflow_grid
   src/field_io.cpp
   src/field_export.cpp
   src/boundary.cpp
+  src/pressure.cpp
+  src/momentum.cpp
+  src/simulation.cpp
+  src/multigrid.cpp
 )
 target_include_directories(aeroflow_grid PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(aeroflow_grid PUBLIC nlohmann_json::nlohmann_json)
@@ -50,6 +55,12 @@ endif()
 # --- CLI --------------------------------------------------------------------
 add_executable(aeroflow-grid src/main.cpp)
 target_link_libraries(aeroflow-grid PRIVATE aeroflow_grid)
+
+# --- Benchmarks (optional) ----------------------------------------------------
+if(AEROFLOW_BUILD_BENCH)
+  add_executable(pressure_bench bench/pressure_bench.cpp)
+  target_link_libraries(pressure_bench PRIVATE aeroflow_grid)
+endif()
 
 # --- Tests ------------------------------------------------------------------
 if(AEROFLOW_BUILD_TESTS)
@@ -74,6 +85,11 @@ if(AEROFLOW_BUILD_TESTS)
     tests/test_divergence.cpp
     tests/test_fields.cpp
     tests/test_boundary.cpp
+    tests/test_pressure.cpp
+    tests/test_momentum.cpp
+    tests/test_simulation.cpp
+    tests/test_multigrid.cpp
+    tests/test_mgpcg.cpp
   )
   target_link_libraries(aeroflow_tests PRIVATE aeroflow_grid GTest::gtest_main)
   target_compile_definitions(aeroflow_tests PRIVATE AEROFLOW_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../fixtures")

@@ -220,7 +220,7 @@ TEST(FieldExport, WritesRequestedFieldsWithSummaries) {
   fs::create_directories(dir);
   Grid3D mask(6, 4, 4, 1.2, 0.8, 0.8);
   mark_solid_box(mask, {{0.4, 0.2, 0.2}, {0.8, 0.6, 0.6}});
-  const auto summaries = export_fields(mask, {kDivergenceDiagnostic}, dir.string());
+  const auto summaries = export_fields(mask, {kDivergenceDiagnostic}, dir.string()).fields;
   ASSERT_EQ(summaries.size(), 1u);
   EXPECT_EQ(summaries[0]["file"], "divergence_diagnostic.f0.affield");
   EXPECT_EQ(summaries[0]["frame"]["index"], 0);
@@ -229,9 +229,9 @@ TEST(FieldExport, WritesRequestedFieldsWithSummaries) {
   const auto f = read_field_file((dir / "divergence_diagnostic.f0.affield").string());
   EXPECT_EQ(f.values.size(), mask.cell_count());
 
-  EXPECT_THROW(export_fields(mask, {"pressure"}, dir.string()), std::invalid_argument);
+  EXPECT_THROW(export_fields(mask, {"vorticity"}, dir.string()), std::invalid_argument);
   EXPECT_THROW(export_fields(mask, {kDivergenceDiagnostic}, (dir / "missing").string()), FieldError);
-  EXPECT_TRUE(export_fields(mask, {}, (dir / "missing").string()).empty());
+  EXPECT_TRUE(export_fields(mask, {}, (dir / "missing").string()).fields.empty());
   fs::remove_all(dir);
 }
 

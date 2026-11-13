@@ -25,6 +25,9 @@ struct DivergenceField {
 // Throws std::invalid_argument if `mask` does not describe the same grid as `mac`.
 DivergenceField compute_divergence(const MacGrid& mac, const Grid3D& mask);
 
+// Same, writing into `out` (reallocated only if its extents differ): no per-step allocation.
+void compute_divergence_into(const MacGrid& mac, const Grid3D& mask, DivergenceField& out);
+
 std::size_t count_fluid_cells(const Grid3D& mask) noexcept;
 
 struct DivergenceStats {

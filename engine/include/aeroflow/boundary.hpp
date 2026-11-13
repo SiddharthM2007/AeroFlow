@@ -80,6 +80,11 @@ void validate_boundaries(const BoundaryMap& map, const BoundaryConditions& bc);
 // Validates first; throws BoundaryError if the map does not match the grid.
 void apply_velocity_bcs(MacGrid& mac, const BoundaryMap& map, const BoundaryConditions& bc);
 
+// Writes only the prescribed faces (Inlet, SlipWall, SolidWall, Inactive); Outlet and Interior
+// faces are untouched. Used after a pressure projection, whose outlet velocities are final and
+// must not be overwritten by the zero-gradient predictor copy.
+void apply_prescribed_velocity_bcs(MacGrid& mac, const BoundaryMap& map, const BoundaryConditions& bc);
+
 // --- tangential ghost rules -------------------------------------------------------------------
 
 enum class VelocityComponent { U, V, W };

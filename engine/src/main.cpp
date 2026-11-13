@@ -14,6 +14,7 @@
 
 #include "aeroflow/config.hpp"
 #include "aeroflow/field_export.hpp"
+#include "aeroflow/simulation.hpp"
 #include "aeroflow/metadata.hpp"
 
 namespace {
@@ -98,9 +99,22 @@ int main(int argc, char** argv) {
     const aeroflow::BuiltGrid built = aeroflow::build(config);
     nlohmann::json meta =
         aeroflow::grid_metadata(built.grid, config, opts.include_cells, built.mesh ? &*built.mesh : nullptr);
-    meta["fields"] = config.fields ? aeroflow::export_fields(built.grid, config.fields->requested,
-                                                              config.fields->output_dir)
-                                   : nlohmann::json::array();
+    meta["fields"] = nlohmann::json::array();
+    meta["projection"] = nullptr;
+    meta["simulation"] = nullptr;
+    if (config.fields) {
+      // Progress lines go to stderr as JSON ({"progress": {...}}); the final error, if any, is
+      // always the last stderr line.
+      const auto progress = [](const nlohmann::json& p) {
+        std::cerr << nlohmann::json{{"progress", p}}.dump() << std::endl;
+      };
+      auto exported = aeroflow::export_fields(built.grid, config.fields->requested, config.fields->output_dir,
+                                              config.projection.value_or(aeroflow::ProjectionConfig{}),
+                                              config.simulation.value_or(aeroflow::SimulationConfig{}), progress);
+      meta["fields"] = std::move(exported.fields);
+      meta["projection"] = std::move(exported.projection);
+      meta["simulation"] = std::move(exported.simulation);
+    }
     const std::string body = meta.dump(opts.pretty ? 2 : -1);
 
     if (opts.output_path.empty()) {
@@ -110,6 +124,16 @@ int main(int argc, char** argv) {
       if (!out) return report_error(kExitIo, "io", "cannot write output file: " + opts.output_path);
       out << body << '\n';
     }
+  } catch (const aeroflow::SimulationError& e) {
+    const bool user_error = e.code() != "non_finite";
+    return report_error(user_error ? kExitConfig : kExitIo,
+                        e.code() == "invalid_settings" ? "invalid_simulation_settings" : e.code(), e.what());
+  } catch (const aeroflow::ProjectionError& e) {
+    const bool user_error = e.code() == "invalid_settings" || e.code() == "incompatible_component";
+    return report_error(user_error ? kExitConfig : kExitIo,
+                        e.code() == "invalid_settings" ? "invalid_projection_settings" : e.code(), e.what());
+  } catch (const aeroflow::BoundaryError& e) {
+    return report_error(kExitConfig, "invalid_boundaries", e.what());
   } catch (const aeroflow::FieldError& e) {
     return report_error(kExitIo, "field_export", e.what());
   } catch (const aeroflow::MeshError& e) {
