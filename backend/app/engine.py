@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +23,10 @@ class EngineError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class EngineCancelled(RuntimeError):
+    """The run was cancelled by the user."""
 
 
 class GridEngine:
@@ -72,5 +79,87 @@ class GridEngine:
 
         try:
             return json.loads(proc.stdout)
+        except ValueError as exc:
+            raise EngineError("bad_output", "engine produced invalid JSON") from exc
+
+    def run_streaming(
+        self,
+        config: dict[str, Any],
+        include_cells: bool,
+        on_progress: Callable[[dict[str, Any]], None],
+        hard_timeout_s: float,
+        cancel: threading.Event,
+    ) -> dict[str, Any]:
+        """Runs the engine, forwarding {"progress": ...} stderr lines as they arrive.
+
+        Kills the process on cancel (EngineCancelled) or after hard_timeout_s (EngineError
+        "timeout"); the engine normally stops itself earlier at its own wall-time budget.
+        """
+        self._require()
+        args = [str(self.path), "-"]
+        if not include_cells:
+            args.append("--no-cells")
+        proc = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        stdout_chunks: list[str] = []
+        reader = threading.Thread(target=lambda: stdout_chunks.append(proc.stdout.read()), daemon=True)
+        reader.start()
+        killed: dict[str, str | None] = {"reason": None}
+        finished = threading.Event()
+
+        def watchdog() -> None:
+            deadline = time.monotonic() + hard_timeout_s
+            while not finished.is_set():
+                if cancel.wait(0.1):
+                    killed["reason"] = "cancelled"
+                    break
+                if time.monotonic() > deadline:
+                    killed["reason"] = "timeout"
+                    break
+            if killed["reason"] and proc.poll() is None:
+                proc.kill()
+
+        guard = threading.Thread(target=watchdog, daemon=True)
+        guard.start()
+        try:
+            proc.stdin.write(json.dumps(config))
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+
+        last_line = ""
+        for line in proc.stderr:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except ValueError:
+                last_line = line
+                continue
+            if isinstance(message, dict) and "progress" in message:
+                on_progress(message["progress"])
+            else:
+                last_line = line
+        proc.wait()
+        reader.join()
+        finished.set()
+        guard.join()
+
+        if killed["reason"] == "cancelled":
+            raise EngineCancelled("simulation cancelled")
+        if killed["reason"] == "timeout":
+            raise EngineError("timeout", f"engine exceeded the hard limit of {hard_timeout_s:g}s and was stopped")
+        if proc.returncode != 0:
+            code, message = "engine_failed", last_line or "engine exited with an error"
+            try:
+                err = json.loads(last_line)["error"]
+                code, message = err["code"], err["message"]
+            except (ValueError, KeyError, TypeError):
+                pass
+            raise EngineError(code, message)
+        try:
+            return json.loads(stdout_chunks[0] if stdout_chunks else "")
         except ValueError as exc:
             raise EngineError("bad_output", "engine produced invalid JSON") from exc

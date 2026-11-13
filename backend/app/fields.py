@@ -23,7 +23,19 @@ from typing import Any
 FIELD_MAGIC = b"AFFIELD\0"
 FIELD_VERSION = 1
 FIELD_MEDIA_TYPE = "application/octet-stream"
-KNOWN_FIELDS = ("divergence_diagnostic",)
+KNOWN_FIELDS = (
+    "divergence_diagnostic",
+    "pressure",
+    "divergence_before",
+    "divergence_after",
+    "velocity_magnitude",
+    "sim_pressure",
+    "sim_velocity_magnitude",
+    "sim_divergence",
+    "sim_u",
+    "sim_v",
+    "sim_w",
+)
 
 _DTYPE_SIZE = {"float32": 4, "uint8": 1}
 _REQUIRED_BLOCKS = {"values": "float32", "valid": "uint8"}

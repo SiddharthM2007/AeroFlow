@@ -21,7 +21,24 @@ CellCount = Annotated[int, Field(ge=1, strict=True)]
 PositiveScale = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 LengthUnit = Literal["mm", "cm", "m", "in"]
 GeometrySource = Literal["procedural_box", "mesh"]
-FieldId = Literal["divergence_diagnostic"]
+FieldId = Literal[
+    "divergence_diagnostic",
+    "pressure",
+    "divergence_before",
+    "divergence_after",
+    "velocity_magnitude",
+    "sim_pressure",
+    "sim_velocity_magnitude",
+    "sim_divergence",
+    "sim_u",
+    "sim_v",
+    "sim_w",
+]
+PROJECTION_FIELDS = {"pressure", "divergence_before", "divergence_after", "velocity_magnitude"}
+SIMULATION_FIELDS = {"sim_pressure", "sim_velocity_magnitude", "sim_divergence", "sim_u", "sim_v", "sim_w"}
+FACE_FIELDS = {"sim_u", "sim_v", "sim_w"}
+JobStatus = Literal["queued", "running", "completed", "stopped", "failed", "cancelled"]
+FINAL_STATUSES = {"completed", "stopped", "failed", "cancelled"}
 
 # Relative tolerance when checking the client's matrix against the parameters.
 MATRIX_RTOL = 1e-9
@@ -93,6 +110,69 @@ class ModelTransformSpec(StrictModel):
         )
 
 
+# Pressure Poisson solver (Milestone 7): "auto" picks MG-PCG from 1,000 fluid cells, else Jacobi-PCG.
+# Both solve the same equations to the same tolerance; MG-PCG only accelerates the solve.
+PressureSolver = Literal["auto", "mgpcg", "jacobi_pcg"]
+
+
+class ProjectionSettings(StrictModel):
+    """Pressure projection of the initialized field (Milestone 5). Mirrors the engine's checks."""
+
+    inlet_velocity: Annotated[float, Field(ge=0, allow_inf_nan=False)] = Field(
+        default=5.0, description="m/s along +x; also used by the divergence diagnostic"
+    )
+    density: Annotated[float, Field(gt=0, allow_inf_nan=False)] = Field(default=1.225, description="kg/m^3")
+    dt: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = Field(
+        default=None, description="s; default CFL 0.5 * min(dx, dy, dz) / inlet_velocity"
+    )
+    tolerance: Annotated[float, Field(gt=0, lt=1, allow_inf_nan=False)] = Field(
+        default=1e-10, description="relative residual ||b - A phi|| / ||b||"
+    )
+    max_iterations: Annotated[int, Field(ge=1, le=1_000_000, strict=True)] = 10_000
+    pressure_solver: PressureSolver = Field(
+        default="auto", description="'auto' (MG-PCG from 1,000 fluid cells), 'mgpcg' or 'jacobi_pcg'"
+    )
+
+    @model_validator(mode="after")
+    def _dt_needs_inflow(self) -> ProjectionSettings:
+        if self.dt is None and self.inlet_velocity == 0:
+            raise ValueError("dt: must be given explicitly when inlet_velocity is 0")
+        return self
+
+
+class SimulationSettings(StrictModel):
+    """Time-dependent Navier-Stokes run (Milestone 6). Mirrors the engine's checks."""
+
+    inlet_velocity: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 5.0
+    density: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1.225
+    viscosity: Annotated[float, Field(ge=0, allow_inf_nan=False)] = Field(default=1.5e-5, description="m^2/s")
+    duration: Annotated[float, Field(gt=0, allow_inf_nan=False)] = Field(default=0.5, description="s")
+    frame_interval: Annotated[float, Field(gt=0, allow_inf_nan=False)] = Field(default=0.05, description="s")
+    cfl: Annotated[float, Field(gt=0, le=1, allow_inf_nan=False)] = 0.5
+    dt: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = Field(
+        default=None, description="s; upper limit per step, rejected if unstable at t = 0"
+    )
+    max_steps: Annotated[int, Field(ge=1, le=1_000_000, strict=True)] = 2000
+    tolerance: Annotated[float, Field(gt=0, lt=1, allow_inf_nan=False)] = 1e-8
+    max_iterations: Annotated[int, Field(ge=1, le=1_000_000, strict=True)] = 10_000
+    initial: Literal["uniform", "rest"] = "uniform"
+    pressure_solver: PressureSolver = Field(
+        default="auto", description="'auto' (MG-PCG from 1,000 fluid cells), 'mgpcg' or 'jacobi_pcg'"
+    )
+
+    @model_validator(mode="after")
+    def _frame_count(self) -> SimulationSettings:
+        if self.duration / self.frame_interval > 10_000:
+            raise ValueError("frame_interval: duration / frame_interval must not exceed 10000 frames")
+        return self
+
+    @property
+    def frame_count(self) -> int:
+        import math
+
+        return int(math.ceil(self.duration / self.frame_interval - 1e-9)) + 1
+
+
 class GridJobRequest(StrictModel):
     domain: Domain
     resolution: Resolution
@@ -118,7 +198,17 @@ class GridJobRequest(StrictModel):
     fields: list[FieldId] = Field(
         default_factory=list,
         description="Numerical fields to export as AFFIELD files (opt-in). "
-        "'divergence_diagnostic' is an initialized diagnostic, not a solved flow.",
+        "'divergence_diagnostic' is an initialized diagnostic; pressure, divergence_before, "
+        "divergence_after and velocity_magnitude come from one pressure projection. None of "
+        "them is a time-accurate flow solution.",
+    )
+    projection: ProjectionSettings | None = Field(
+        default=None, description="Projection settings; engine defaults when omitted."
+    )
+    simulation: SimulationSettings | None = Field(
+        default=None,
+        description="Navier-Stokes run settings for sim_* fields (defaults when omitted). "
+        "Simulation jobs run asynchronously: poll GET /api/grid-jobs/{id}.",
     )
 
     @model_validator(mode="after")
@@ -161,6 +251,14 @@ class GridJobRequest(StrictModel):
                 )
         return self
 
+    @property
+    def is_simulation(self) -> bool:
+        return any(f in SIMULATION_FIELDS for f in self.fields)
+
+    @property
+    def simulation_settings(self) -> SimulationSettings:
+        return self.simulation or SimulationSettings()
+
     def engine_config(
         self, triangles_file: str | None = None, fields_dir: str | None = None
     ) -> dict[str, Any]:
@@ -170,6 +268,10 @@ class GridJobRequest(StrictModel):
             if fields_dir is None:
                 raise ValueError("field export needs an output directory")
             config["fields"] = {"output_dir": fields_dir, "requested": list(self.fields)}
+            if self.projection is not None:
+                config["projection"] = self.projection.model_dump(mode="json", exclude_none=True)
+            if self.is_simulation:
+                config["simulation"] = self.simulation_settings.model_dump(mode="json", exclude_none=True)
         if self.geometry_source == "mesh":
             if triangles_file is None:
                 raise ValueError("mesh jobs need a prepared triangles file")
@@ -192,9 +294,12 @@ class ModelInfo(BaseModel):
 
 class GridJob(BaseModel):
     job_id: str
-    status: Literal["completed", "failed"]
+    status: JobStatus
     created_at: datetime
-    finished_at: datetime
+    finished_at: datetime | None = None
+    # Simulation jobs: preflight estimate and live progress ({step, time, duration, ...}).
+    estimate: dict[str, Any] | None = None
+    progress: dict[str, Any] | None = None
     request: GridJobRequest
     result: dict[str, Any] | None = None
     error: dict[str, str] | None = None

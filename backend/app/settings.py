@@ -20,6 +20,8 @@ class Settings:
     max_triangles: int
     max_field_bytes: int
     max_fields_disk_bytes: int
+    sim_timeout_s: float
+    sim_max_memory_bytes: int
     max_jobs_retained: int
     cors_origins: tuple[str, ...]
 
@@ -53,6 +55,9 @@ def load_settings() -> Settings:
         max_triangles=int(env.get("AEROFLOW_MAX_TRIANGLES", "1000000")),
         max_field_bytes=int(env.get("AEROFLOW_MAX_FIELD_MB", "64")) * 1024 * 1024,
         max_fields_disk_bytes=int(env.get("AEROFLOW_MAX_FIELDS_DISK_MB", "1024")) * 1024 * 1024,
+        # Navier-Stokes jobs: wall-time budget (preflight + engine hard stop) and memory limit.
+        sim_timeout_s=float(env.get("AEROFLOW_SIM_TIMEOUT_S", "900")),
+        sim_max_memory_bytes=int(env.get("AEROFLOW_SIM_MAX_MEMORY_MB", "4096")) * 1024 * 1024,
         max_jobs_retained=int(env.get("AEROFLOW_MAX_JOBS", "50")),
         cors_origins=tuple(
             o.strip()
