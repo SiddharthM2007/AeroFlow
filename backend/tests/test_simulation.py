@@ -78,6 +78,10 @@ def test_simulation_runs_asynchronously_with_frames(client: TestClient, engine_b
         header, _ = _decode(r.content)
         assert header["frame"]["index"] == frame and header["frame"]["time_s"] == pytest.approx(t)
     assert client.get(f"/api/grid-jobs/{job['job_id']}/fields/sim_pressure?frame=3").status_code == 404
+    # Finished jobs' field files never change: the browser may cache them (Milestone 8 playback).
+    r = client.get(f"/api/grid-jobs/{job['job_id']}/fields/sim_pressure?frame=1")
+    assert r.headers["cache-control"] == "private, max-age=86400, immutable"
+    assert r.headers["x-aeroflow-field-version"] == "1"
 
 
 def test_velocity_components_use_face_locations(client: TestClient, engine_built) -> None:

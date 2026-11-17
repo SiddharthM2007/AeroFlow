@@ -454,7 +454,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         path = field_store.path(job_id, name, frame)
         if path is None:
             raise HTTPException(status.HTTP_410_GONE, f"field '{name}' data is no longer stored")
-        return FileResponse(path, media_type=FIELD_MEDIA_TYPE, headers={"X-AeroFlow-Field-Version": "1"})
+        # Field files are registered only once a job has finished and are never rewritten (job ids are
+        # unique), so the browser may reuse them: replaying frames needs no new downloads.
+        return FileResponse(
+            path,
+            media_type=FIELD_MEDIA_TYPE,
+            headers={"X-AeroFlow-Field-Version": "1", "Cache-Control": "private, max-age=86400, immutable"},
+        )
 
     @app.get("/api/grid-jobs/{job_id}", response_model=GridJob)
     def get_grid_job(job_id: str) -> GridJob:
