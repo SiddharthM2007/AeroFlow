@@ -728,6 +728,58 @@ select:
 
 A run rejected over the time budget is told whether the other solver would fit.
 
+## Time-dependent visualization (Milestone 8, in progress)
+
+These features are visualization only. The engine, solver and AFFIELD files are unchanged.
+
+**Playback (8A):**
+
+- **Controls:** Play/Pause, frame stepping (also space and ←/→), speeds 0.5×, 1×, 2× and 4× of 4 frames/s, and looping.
+- **No skipped frames:** playback advances only to frames that are already decoded. If a frame isn't ready it waits and says so; it never skips one or blanks the slice.
+- **Cache:** decoded frames are kept in a 256 MB least-recently-used cache. Frames are prefetched ahead in playback order (at most half the budget), and requests that are no longer needed are cancelled.
+- **Browser caching:** field files are sent as `Cache-Control: immutable`, since a finished job's files never change.
+
+**Colour scales (8A):**
+
+- **Modes:** *all frames* (default for time series), *this frame* or *manual*.
+- **All-frames range:** computed from the per-frame header statistics.
+- **Frame 1 of the simulation pressure:** it is the initial-projection impulse, so it is labelled as such and left out of the all-frames range.
+
+**Velocity visualization (8B/8C).** One mode at a time: *Instantaneous streamlines* or *Particle paths*. Both need the u(t), v(t) and w(t) exports.
+
+- **Velocity reconstruction:**
+  - Each MAC component is interpolated trilinearly on its own face grid, which reproduces the stored values exactly.
+  - Only valid samples are used, with renormalized weights; faces inside solids are invalid.
+  - The stored zero normal velocity on wall faces is kept, and no wall model is added.
+  - Every integration step is checked cell by cell, so no step crosses a solid cell.
+- **Instantaneous streamlines:** curves tangent to the velocity of the displayed frame only (RK4 along u/|u|, half-cell steps).
+  - They stop at domain exits, solids, stagnation (|u| < 10⁻³ of the frame maximum), invalid data, or the length or step limit.
+  - A result is drawn only for the frame it was computed from. While the worker catches up during playback, other frames' lines are hidden.
+- **Particle paths:** passive tracers, released once at a chosen frame. They are not streaklines.
+  - **Integration:** dx/dt = u(x, t), with u linear in time between exported frames at their actual timestamps.
+  - **Substeps:** RK4, at most half a cell of travel along every axis, ending exactly on frame times.
+  - **Display:** paths are computed once, then revealed up to the displayed time, with markers at the tracers' positions.
+- **Temporal-resolution safeguard (particle paths):** displacement per frame is estimated per axis from each frame's header maxima, as max |u_a|·Δt/h_a.
+  - **Above 2 cells:** a warning.
+  - **Above 5 cells:** paths are withheld, and the panel gives the frame interval needed.
+  - **Limits of this check:** substeps cannot recover flow changes between exported frames, and a small displacement is necessary, not sufficient.
+- **Performance and memory:**
+  - A Web Worker fetches and decodes the velocity frames itself. Field files are HTTP-cached, and the main thread neither copies nor retains them.
+  - The worker keeps at most 3 velocity frames, and the 256 MB main-thread cache holds only displayed fields.
+  - Output is capped at 2 M points.
+  - A newer request (another mode, seeds or release frame) cancels the running one and aborts its downloads.
+
+Measured in the browser:
+
+| Case | Seeds or tracers | Worker time | Notes |
+|---|---|---|---|
+| Streamlines, 128×64×64 | 141 | 87 ms | |
+| Streamlines, ~2.1 M cells | 1,024 | 1.0 s | |
+| Particle paths, 64×32×32, 41 frames | 141 | 1.1 s | |
+| Particle paths, Valve Body 128×64×64, 11 frames | 398 | 1.3 s | |
+
+Playback held 15.8–16 fps at 4× with no main-thread stalls.
+
 ## Numerical fields and visualization (approved for Milestone 4A)
 
 ### AFFIELD v1: canonical binary field file
