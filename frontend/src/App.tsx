@@ -15,7 +15,6 @@ import {
   SIMULATION_FIELD_IDS,
   getHealth,
   PROJECTION_FIELD_IDS,
-  fetchField,
   getLimits,
   uploadModel,
   type EstimateResponse,
@@ -48,7 +47,12 @@ import {
   type GeometrySource,
 } from "./lib/geometrySource";
 import { defaultColormap, defaultRange } from "./lib/fields/colormap";
-import { decodeField, type FieldMetadata, type ScalarFieldData } from "./lib/fields/format";
+import { allFramesRange } from "./lib/fields/colorRange";
+import { useFieldFrames } from "./lib/playback/useFieldFrames";
+import { FlowControls } from "./components/FlowControls";
+import { speedRange } from "./components/Streamlines";
+import { useFlowVisualization, type FlowSettings } from "./lib/streamlines/useFlowVisualization";
+import type { FieldMetadata } from "./lib/fields/format";
 import { extractSlice } from "./lib/fields/sampling";
 import { decodeBase64, latticeSegmentCount, makeGridGeometry, type GridGeometry } from "./lib/grid";
 import { browserStorage, loadFieldPrefs, saveFieldPrefs } from "./lib/fieldPrefs";
@@ -162,53 +166,111 @@ export default function App() {
   const [selectedFrame, setSelectedFrame] = useState(0);
   // Slice index is reset to the middle only when the field (not the frame) changes.
   const lastLoadedField = useRef<string | null>(null);
-  const [fieldData, setFieldData] = useState<ScalarFieldData | null>(null);
-  const [fieldStatus, setFieldStatus] = useState<{ loading: boolean; error: string | null }>({ loading: false, error: null });
   const [fieldView, setFieldView] = useState<FieldViewSettings>({
     visible: true,
     axis: 2,
     index: 0,
-    rangeMode: "auto",
+    rangeMode: "frame",
     manual: { min: -1, max: 1 },
     opacity: 0.9,
   });
 
+  // Velocity visualization (Milestone 8B/8C): instantaneous streamlines or particle paths. The
+  // worker loads the velocity frames itself; they are not prefetched into the main-thread cache.
+  const [flowSettings, setFlowSettings] = useState<FlowSettings>({
+    mode: "off",
+    seedMode: "slice",
+    density: 12,
+    maxLength: 2 * DEFAULT_DOMAIN.lx,
+    direction: "both",
+    releaseFrame: 0,
+    showMarkers: true,
+  });
   useEffect(() => {
-    setFieldData(null);
-    if (!result || !selectedField) return;
-    let cancelled = false;
-    setFieldStatus({ loading: true, error: null });
-    fetchField(result.jobId, selectedField, selectedFrame)
-      .then((buffer) => {
-        if (cancelled) return;
-        const decoded = decodeField(buffer);
-        setFieldData(decoded);
-        // Start at the middle slice of the current axis when a different field is shown.
-        const key = `${result.jobId}:${selectedField}`;
-        if (lastLoadedField.current !== key) {
-          lastLoadedField.current = key;
-          setFieldView((v) => ({ ...v, index: Math.floor(decoded.meta.shape[v.axis] / 2) }));
-        }
-        setFieldStatus({ loading: false, error: null });
-      })
-      .catch((e) => !cancelled && setFieldStatus({ loading: false, error: (e as Error).message }));
-    return () => {
-      cancelled = true;
+    if (result) setFlowSettings((s) => ({ ...s, maxLength: 2 * result.meta.grid.domain.lx, releaseFrame: 0 }));
+  }, [result]);
+
+  // Frames load through a bounded cache with prefetching; playback advances only to decoded frames.
+  const frames = useFieldFrames(
+    result?.jobId ?? null,
+    result?.fields ?? [],
+    selectedField,
+    selectedFrame,
+    setSelectedFrame,
+  );
+  const fieldData = frames.data;
+  useEffect(() => {
+    if (!fieldData || !result) return;
+    // A different field: start at the middle slice, and use one colour range for all frames of a
+    // time series (the per-frame range rescales colours on every frame).
+    const key = `${result.jobId}:${fieldData.meta.name}`;
+    if (lastLoadedField.current === key) return;
+    lastLoadedField.current = key;
+    setFieldView((v) => ({
+      ...v,
+      index: Math.floor(fieldData.meta.shape[v.axis] / 2),
+      rangeMode: v.rangeMode === "manual" ? "manual" : frames.frames.length > 1 ? "all" : "frame",
+    }));
+  }, [fieldData, result, frames.frames.length]);
+
+  // Keyboard: space plays/pauses, arrows step frames (ignored while typing or on form controls).
+  useEffect(() => {
+    if (frames.frames.length < 2) return;
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && t.closest("input, select, textarea, button, [contenteditable]")) return;
+      if (e.key === " ") {
+        e.preventDefault();
+        if (frames.playback.playing) frames.pause();
+        else frames.play();
+      } else if (e.key === "ArrowRight") {
+        frames.step(1);
+      } else if (e.key === "ArrowLeft") {
+        frames.step(-1);
+      }
     };
-  }, [result, selectedField, selectedFrame]);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [frames]);
 
   const fieldColormap = fieldData ? defaultColormap(fieldData.meta) : null;
   const fieldRange =
     fieldData && fieldColormap
-      ? fieldView.rangeMode === "auto"
+      ? fieldView.rangeMode === "frame"
         ? defaultRange(fieldData.meta, fieldColormap)
-        : fieldView.manual
+        : fieldView.rangeMode === "all"
+          ? (allFramesRange(frames.frames, fieldColormap) ?? defaultRange(fieldData.meta, fieldColormap))
+          : fieldView.manual
       : null;
   const fieldIndex = fieldData ? Math.min(fieldView.index, fieldData.meta.shape[fieldView.axis] - 1) : 0;
   const fieldPlane = useMemo(
     () => (fieldData ? extractSlice(fieldData, fieldView.axis, fieldIndex).planeCoordinate : null),
     [fieldData, fieldView.axis, fieldIndex],
   );
+
+  const streamlineSlice = useMemo(
+    () => (fieldPlane !== null ? { axis: fieldView.axis, coordinate: fieldPlane } : null),
+    [fieldView.axis, fieldPlane],
+  );
+  const flow = useFlowVisualization({
+    jobId: result?.jobId ?? null,
+    fields: result?.fields ?? [],
+    frame: selectedFrame,
+    solid: result?.cells ?? null,
+    settings: flowSettings,
+    slice: streamlineSlice,
+  });
+  // Colour by |u| on the velocity-magnitude field's all-frames scale when it was exported, so lines
+  // and slices share one scale; otherwise on the range of the computed speeds.
+  const speedFrames = useMemo(() => (result?.fields ?? []).filter((f) => f.name === "sim_velocity_magnitude"), [result]);
+  const flowResult = flow.streamlines ?? flow.pathlines;
+  const flowRange = flowResult ? (allFramesRange(speedFrames, "sequential") ?? speedRange(flowResult)) : null;
+  const velocityFrames = useMemo(
+    () => (result?.fields ?? []).filter((f) => f.name === "sim_u").sort((a, b) => a.frame.index - b.frame.index),
+    [result],
+  );
+  const frameTime = (f: number) => velocityFrames.find((m) => m.frame.index === f)?.frame.time_s ?? null;
+  const displayedTime = frameTime(selectedFrame);
 
   useEffect(() => {
     getHealth()
@@ -723,9 +785,10 @@ export default function App() {
             }}
             frame={selectedFrame}
             onFrameChange={setSelectedFrame}
+            frames={frames}
             data={fieldData}
-            loading={fieldStatus.loading}
-            error={fieldStatus.error}
+            loading={frames.loading}
+            error={frames.error}
             view={fieldView}
             onViewChange={setFieldView}
             colormap={fieldColormap}
@@ -733,6 +796,27 @@ export default function App() {
             planeCoordinate={fieldPlane}
             projection={result.meta.projection ?? null}
             simulation={result.meta.simulation ?? null}
+          />
+        )}
+        {result && result.meta.simulation && (
+          <FlowControls
+            settings={flowSettings}
+            onChange={setFlowSettings}
+            status={flow.status}
+            streamlines={flow.streamlines}
+            lastStreamlineFrame={flow.streamlineFrame}
+            pathlines={flow.pathlines}
+            temporal={flow.temporal}
+            frame={selectedFrame}
+            frameTime={frameTime}
+            velocityFrames={velocityFrames}
+            colorNote={
+              speedFrames.length > 0
+                ? "Coloured by |u| on the velocity-magnitude scale (all frames)."
+                : "Coloured by |u| over the range of these curves (export |u|(t) to share the slice scale)."
+            }
+            sliceAvailable={streamlineSlice !== null}
+            workerFrames={flow.workerFrames}
           />
         )}
 
@@ -800,6 +884,12 @@ export default function App() {
           testBox={display.showTestBox ? activeBox : null}
           grid={{ preview, result: result ? { grid: result.grid, cells: result.cells } : null, display }}
           frame={frame}
+          streamlines={flow.streamlines && flowRange ? { result: flow.streamlines, range: flowRange } : null}
+          pathlines={
+            flow.pathlines && flowRange && displayedTime !== null
+              ? { result: flow.pathlines, time: displayedTime, range: flowRange, showMarkers: flowSettings.showMarkers }
+              : null
+          }
           fieldSlice={
             fieldData && fieldRange && fieldColormap && fieldView.visible
               ? {
@@ -821,6 +911,8 @@ export default function App() {
             axis={fieldView.axis}
             index={fieldIndex}
             planeCoordinate={fieldPlane}
+            frameCount={frames.frames.length}
+            rangeMode={fieldView.rangeMode}
           />
         )}
       </main>

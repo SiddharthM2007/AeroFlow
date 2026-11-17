@@ -7,6 +7,9 @@ import type { LoadedModel } from "../lib/loaders";
 import { UNIT_TO_METERS, type Bounds, type LengthUnit } from "../lib/transform";
 import type { Domain, GizmoMode, ModelTransform, TestBox } from "../lib/types";
 import { FieldSlice, type FieldSliceProps } from "./FieldSlice";
+import { Pathlines, Streamlines } from "./Streamlines";
+import type { PathlineResult, TraceResult } from "../lib/streamlines/engine";
+import type { ColorRange } from "../lib/fields/colormap";
 import { GridOverlay, type GridOverlayProps } from "./GridOverlay";
 
 interface ViewerProps {
@@ -21,6 +24,10 @@ interface ViewerProps {
   grid: GridOverlayProps;
   /** Scalar field slice to draw, if any. */
   fieldSlice: FieldSliceProps | null;
+  /** Instantaneous streamlines of the displayed frame (Milestone 8B), coloured by |u| over `range`. */
+  streamlines?: { result: TraceResult; range: ColorRange } | null;
+  /** Particle paths up to the displayed time `time` (Milestone 8C). */
+  pathlines?: { result: PathlineResult; time: number; range: ColorRange; showMarkers: boolean } | null;
   /** Camera framing request; a new `id` re-frames the camera onto `bounds`. */
   frame: { id: number; bounds: Bounds };
 }
@@ -53,6 +60,8 @@ export function Viewer(props: ViewerProps) {
       )}
       <GridOverlay {...props.grid} />
       {props.fieldSlice && <FieldSlice {...props.fieldSlice} />}
+      {props.streamlines && <Streamlines result={props.streamlines.result} range={props.streamlines.range} />}
+      {props.pathlines && <Pathlines {...props.pathlines} />}
 
       <axesHelper args={[span * 0.15]} />
       <OrbitControls makeDefault />

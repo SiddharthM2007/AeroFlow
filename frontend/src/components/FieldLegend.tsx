@@ -1,4 +1,5 @@
 import { cssGradient, legendTicks, type ColorRange, type ColormapKind } from "../lib/fields/colormap";
+import type { RangeMode } from "../lib/fields/colorRange";
 import type { FieldMetadata } from "../lib/fields/format";
 import { provenanceLabel } from "../lib/fields/provenance";
 import { AXIS_NAMES, type Axis } from "../lib/fields/sampling";
@@ -10,11 +11,14 @@ interface FieldLegendProps {
   axis: Axis;
   index: number;
   planeCoordinate: number;
+  /** Frames in the field's time series (1 for single fields). */
+  frameCount?: number;
+  rangeMode?: RangeMode;
 }
 
 const fmt = (v: number) => (v === 0 ? "0" : Math.abs(v) >= 1e4 || Math.abs(v) < 1e-3 ? v.toExponential(2) : String(Number(v.toPrecision(4))));
 
-export function FieldLegend({ meta, range, colormap, axis, index, planeCoordinate }: FieldLegendProps) {
+export function FieldLegend({ meta, range, colormap, axis, index, planeCoordinate, frameCount = 1, rangeMode }: FieldLegendProps) {
   const ticks = legendTicks(range);
   const span = range.max - range.min;
   return (
@@ -36,8 +40,20 @@ export function FieldLegend({ meta, range, colormap, axis, index, planeCoordinat
         )}
       </div>
       <div className="legend-meta muted">
-        {AXIS_NAMES[axis]}-slice {index} at {AXIS_NAMES[axis]} = {fmt(planeCoordinate)} m · frame {meta.frame.index}
-        {meta.frame.label ? ` (${meta.frame.label})` : ""}
+        {AXIS_NAMES[axis]}-slice {index} at {AXIS_NAMES[axis]} = {fmt(planeCoordinate)} m
+        {frameCount > 1 && (
+          <>
+            {" "}
+            · frame {meta.frame.index + 1}/{frameCount}
+            {meta.frame.label ? ` (${meta.frame.label})` : ""}
+          </>
+        )}
+        {rangeMode && (
+          <>
+            {" "}
+            · range: {rangeMode === "all" ? "all frames" : rangeMode === "frame" ? (frameCount > 1 ? "this frame" : "auto") : "manual"}
+          </>
+        )}
       </div>
     </div>
   );

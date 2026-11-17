@@ -1,4 +1,7 @@
 import type { ColorRange, ColormapKind } from "../lib/fields/colormap";
+import { isInitialProjectionImpulse, type RangeMode } from "../lib/fields/colorRange";
+import { SPEEDS, targetFps, type Speed } from "../lib/playback/playback";
+import type { FieldFrames } from "../lib/playback/useFieldFrames";
 import type { FieldId, ProjectionStats, SimulationSummary } from "../lib/api";
 import { SOLVER_LABELS, fallbackNotice, solverHeadline } from "../lib/pressureSolver";
 import type { FieldMetadata, ScalarFieldData } from "../lib/fields/format";
@@ -10,7 +13,7 @@ export interface FieldViewSettings {
   visible: boolean;
   axis: Axis;
   index: number;
-  rangeMode: "auto" | "manual";
+  rangeMode: RangeMode;
   manual: ColorRange;
   opacity: number;
 }
@@ -22,6 +25,8 @@ interface FieldsPanelProps {
   /** Frame index of the selected field (time-dependent fields have several). */
   frame: number;
   onFrameChange: (frame: number) => void;
+  /** Frame loading, cache and playback for the selected field. */
+  frames: FieldFrames;
   data: ScalarFieldData | null;
   loading: boolean;
   error: string | null;
@@ -186,26 +191,12 @@ export function FieldsPanel(props: FieldsPanelProps) {
           ))}
         </select>
       </label>
-      {frames.length > 1 && (
-        <div className="frame-select">
-          <div className="row">
-            <span className="small">Frame</span>
-            <input
-              type="range"
-              min={0}
-              max={frames.length - 1}
-              value={Math.max(0, frames.indexOf(frameMeta!))}
-              onChange={(e) => props.onFrameChange(frames[Number(e.target.value)].frame.index)}
-            />
-            <span className="mono">
-              {frames.indexOf(frameMeta!) + 1}/{frames.length}
-            </span>
-          </div>
-          <p className="small">
-            Simulation time <b>t = {fmt(frameMeta?.frame.time_s ?? null)} s</b>
-            {typeof frameMeta?.provenance.step === "number" && <> · step {frameMeta.provenance.step as number}</>}
-          </p>
-        </div>
+      {frames.length > 1 && <PlaybackControls frames={props.frames} frameMeta={frameMeta} />}
+      {frameMeta && frames.length > 1 && isInitialProjectionImpulse(frameMeta) && (
+        <p className="warn small">
+          Frame 1 shows the initial-projection impulse (ρφ/Δt of the projection of the prescribed initial field), not a
+          pressure of the flow. It is left out of the all-frames colour range.
+        </p>
       )}
 
       {meta && provenanceLabel(meta) && (
@@ -266,13 +257,21 @@ export function FieldsPanel(props: FieldsPanelProps) {
             </p>
           )}
           <div className="segmented">
-            {(["auto", "manual"] as const).map((m) => (
+            {(frames.length > 1 ? (["all", "frame", "manual"] as const) : (["frame", "manual"] as const)).map((m) => (
               <button
                 key={m}
                 className={view.rangeMode === m ? "active" : ""}
+                title={
+                  m === "all"
+                    ? "One range for every frame, so a colour means the same value in every frame"
+                    : m === "frame"
+                      ? "This frame's own range (colours rescale between frames)"
+                      : undefined
+                }
                 onClick={() => set({ rangeMode: m, manual: m === "manual" && props.range ? props.range : view.manual })}
               >
-                {m === "auto" ? (props.colormap === "diverging" ? "Auto (±max, 0-centred)" : "Auto (min–max)") : "Manual range"}
+                {m === "all" ? "All frames" : m === "frame" ? (frames.length > 1 ? "This frame" : "Auto") : "Manual"}
+                {m !== "manual" && (props.colormap === "diverging" ? " (±max)" : " (min–max)")}
               </button>
             ))}
           </div>
@@ -296,5 +295,82 @@ export function FieldsPanel(props: FieldsPanelProps) {
         </>
       )}
     </Panel>
+  );
+}
+
+const SPEED_LABELS: Record<Speed, string> = { 0.5: "0.5×", 1: "1×", 2: "2×", 4: "4×" };
+
+/** Play/Pause, stepping, speed and looping for a time series (Milestone 8). */
+function PlaybackControls({ frames, frameMeta }: { frames: FieldFrames; frameMeta: FieldMetadata | null }) {
+  const pb = frames.playback;
+  const count = frames.frames.length;
+  const cacheMb = frames.cache.bytes / 1048576;
+  return (
+    <div className="frame-select">
+      <div className="row playback">
+        <button title="First frame" aria-label="First frame" onClick={() => frames.goTo(0)}>
+          ⏮
+        </button>
+        <button title="Previous frame (←)" aria-label="Previous frame" onClick={() => frames.step(-1)}>
+          ◀
+        </button>
+        <button
+          className="primary"
+          title="Play / Pause (space)"
+          aria-label={pb.playing ? "Pause" : "Play"}
+          onClick={() => (pb.playing ? frames.pause() : frames.play())}
+        >
+          {pb.playing ? "❚❚" : "▶"}
+        </button>
+        <button title="Next frame (→)" aria-label="Next frame" onClick={() => frames.step(1)}>
+          ▶|
+        </button>
+        <button title="Last frame" aria-label="Last frame" onClick={() => frames.goTo(count - 1)}>
+          ⏭
+        </button>
+        <select
+          aria-label="Playback speed"
+          value={pb.speed}
+          onChange={(e) => frames.setSpeed(Number(e.target.value) as Speed)}
+          title="Playback speed (frames per second)"
+        >
+          {SPEEDS.map((s) => (
+            <option key={s} value={s}>
+              {SPEED_LABELS[s]} ({targetFps(s)} fps)
+            </option>
+          ))}
+        </select>
+        <label className="check inline">
+          <input type="checkbox" checked={pb.loop} onChange={(e) => frames.setLoop(e.target.checked)} />
+          Loop
+        </label>
+      </div>
+      <div className="row">
+        <span className="small">Frame</span>
+        <input
+          type="range"
+          aria-label="Frame"
+          min={0}
+          max={count - 1}
+          value={frames.position}
+          onChange={(e) => frames.goTo(Number(e.target.value))}
+        />
+        <span className="mono">
+          {frames.position + 1}/{count}
+        </span>
+      </div>
+      <p className="small">
+        Simulation time <b>t = {fmt(frameMeta?.frame.time_s ?? null)} s</b>
+        {typeof frameMeta?.provenance.step === "number" && <> · step {frameMeta.provenance.step as number}</>}
+      </p>
+      <p className="muted small" role="status">
+        {pb.playing
+          ? pb.stalled
+            ? `Waiting for frame ${((frames.position + 1) % count) + 1} to load (playback never skips frames)`
+            : `Playing at ${frames.achievedFps ? fmt(frames.achievedFps) : "–"} of ${targetFps(pb.speed)} fps`
+          : "Paused"}{" "}
+        · cache {frames.cache.entries} frames, {fmt(cacheMb)} of {fmt(frames.cache.budget / 1048576)} MB
+      </p>
+    </div>
   );
 }

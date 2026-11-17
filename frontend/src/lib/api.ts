@@ -306,11 +306,14 @@ export function uploadModel(file: File): Promise<ModelInfo> {
 }
 
 /** Raw AFFIELD bytes for one exported field (decode with decodeField). */
-export async function fetchField(jobId: string, name: string, frame = 0): Promise<ArrayBuffer> {
+export async function fetchField(jobId: string, name: string, frame = 0, signal?: AbortSignal): Promise<ArrayBuffer> {
   let resp: Response;
   try {
-    resp = await fetch(`/api/grid-jobs/${encodeURIComponent(jobId)}/fields/${encodeURIComponent(name)}?frame=${frame}`);
-  } catch {
+    resp = await fetch(`/api/grid-jobs/${encodeURIComponent(jobId)}/fields/${encodeURIComponent(name)}?frame=${frame}`, {
+      signal,
+    });
+  } catch (e) {
+    if (signal?.aborted) throw new DOMException("frame load aborted", "AbortError");
     throw new ApiError("Cannot reach the AeroFlow backend. Is it running on port 8000?");
   }
   if (!resp.ok) {
